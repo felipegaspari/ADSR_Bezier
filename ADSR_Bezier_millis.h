@@ -39,10 +39,10 @@ public:
     adsr(int l_vertical_resolution, float attack_alpha, float attack_decay_release, bool bezier, int bezier_attack_type, int bezier_decay_type, int bezier_release_type)
     {
         _vertical_resolution = l_vertical_resolution; // store vertical resolution (DAC_Size)
-        _attack = 100000;                             // take 100ms as initial value for Attack
+        _attack = 100;                             // take 100ms as initial value for Attack
         _sustain = l_vertical_resolution / 2;         // take half the DAC_size as initial value for sustain
-        _decay = 100000;                              // take 100ms as initial value for Decay
-        _release = 100000;                            // take 100ms as initial value for Release
+        _decay = 100;                              // take 100ms as initial value for Decay
+        _release = 100;                            // take 100ms as initial value for Release
 
         if (bezier == true)
         {
@@ -139,9 +139,9 @@ public:
         _release = l_release;
     }
 
-    void noteOn(unsigned long l_micros)
+    void noteOn(unsigned long l_millis)
     {
-        _t_note_on = l_micros; // set new timestamp for note_on
+        _t_note_on = l_millis; // set new timestamp for note_on
         if (_reset_attack)     // set start value new Attack
             _attack_start = 0; // if _reset_attack equals true, a new trigger starts with 0
         else
@@ -149,28 +149,28 @@ public:
         _notes_pressed++;                 // increase number of pressed notes with one
     }
 
-    void noteOff(unsigned long l_micros)
+    void noteOff(unsigned long l_millis)
     {
         _notes_pressed--;
         if (_notes_pressed <= 0)
         {                                  // if all notes are depressed - start release
-            _t_note_off = l_micros;        // set timestamp for note off
+            _t_note_off = l_millis;        // set timestamp for note off
             _release_start = _adsr_output; // set start value for release
             _notes_pressed = 0;
         }
     }
 
-    int getWave(unsigned long l_micros)
+    int getWave(unsigned long l_millis)
     {
         unsigned long delta = 0;
         if (_t_note_off < _t_note_on)
         { // if note is pressed
-            delta = l_micros - _t_note_on;
+            delta = l_millis - _t_note_on;
             if (delta < _attack)                                                                                                                                                                            // Attack
                 _adsr_output = map(_curve_tables[_bezier_attack_type][ARRAY_SIZE - (int)floor((float)ARRAY_SIZE * (float)delta / (float)_attack)], 0, _vertical_resolution, _attack_start, _vertical_resolution); //
             else if (delta < _attack + _decay)
             { // Decays
-                delta = l_micros - _t_note_on - _attack;
+                delta = l_millis - _t_note_on - _attack;
                 _adsr_output = map(_curve_tables[_bezier_decay_type][(int)floor((float)ARRAY_SIZE * (float)delta / (float)_decay)], 0, _vertical_resolution, _sustain, _vertical_resolution);
             }
             else
@@ -178,7 +178,7 @@ public:
         }
         if (_t_note_off > _t_note_on)
         { // if note not pressed
-            delta = l_micros - _t_note_off;
+            delta = l_millis - _t_note_off;
             if (delta < _release) // release
                 _adsr_output = map(_curve_tables[_bezier_release_type][(int)floor((float)ARRAY_SIZE * (float)delta / (float)_release)], 0, _vertical_resolution, 0, _release_start);
             else
