@@ -118,11 +118,38 @@ public:
     void setAttack(unsigned long l_attack)
     {
         _attack = l_attack;
+
+        // Precompute fixed-point scale for fast time->index mapping (Q6 format)
+        // idx ~= delta_ms * ((ARRAY_SIZE-1) / _attack)
+        // Using Q6 (shift by 6) keeps the product within 32 bits even for long times.
+        if (_attack > 0)
+        {
+            _attack_scale_q6 = ((uint32_t)(ARRAY_SIZE - 1) << 6) / _attack;
+        }
+        else
+        {
+            _attack_scale_q6 = 0;
+        }
+
+        // Keep cached sum for faster stage checks in getWave()
+        _attack_plus_decay = _attack + _decay;
     }
 
     void setDecay(unsigned long l_decay)
     {
         _decay = l_decay;
+
+        if (_decay > 0)
+        {
+            _decay_scale_q6 = ((uint32_t)(ARRAY_SIZE - 1) << 6) / _decay;
+        }
+        else
+        {
+            _decay_scale_q6 = 0;
+        }
+
+        // Keep cached sum for faster stage checks in getWave()
+        _attack_plus_decay = _attack + _decay;
     }
 
     void setSustain(int l_sustain)
@@ -137,6 +164,15 @@ public:
     void setRelease(unsigned long l_release)
     {
         _release = l_release;
+
+        if (_release > 0)
+        {
+            _release_scale_q6 = ((uint32_t)(ARRAY_SIZE - 1) << 6) / _release;
+        }
+        else
+        {
+            _release_scale_q6 = 0;
+        }
     }
 
     void noteOn(unsigned long l_millis)
@@ -163,24 +199,64 @@ public:
     int getWave(unsigned long l_millis)
     {
         unsigned long delta = 0;
+
         if (_t_note_off < _t_note_on)
         { // if note is pressed
+            // Total time since note on
             delta = l_millis - _t_note_on;
-            if (delta < _attack)                                                                                                                                                                            // Attack
-                _adsr_output = map(_curve_tables[_bezier_attack_type][ARRAY_SIZE - (int)floor((float)ARRAY_SIZE * (float)delta / (float)_attack)], 0, _vertical_resolution, _attack_start, _vertical_resolution); //
-            else if (delta < _attack + _decay)
-            { // Decays
-                delta = l_millis - _t_note_on - _attack;
-                _adsr_output = map(_curve_tables[_bezier_decay_type][(int)floor((float)ARRAY_SIZE * (float)delta / (float)_decay)], 0, _vertical_resolution, _sustain, _vertical_resolution);
+
+            // Attack
+            if ((delta < _attack) && (_attack > 0))
+            {
+                // Integer time->index mapping using precomputed Q6 scale
+                uint32_t idx = (delta * _attack_scale_q6) >> 6;
+                if (idx >= ARRAY_SIZE)
+                    idx = ARRAY_SIZE - 1;
+
+                // Attack curve runs "backwards" through the table
+                _adsr_output = map(
+                    _curve_tables[_bezier_attack_type][(ARRAY_SIZE - 1) - (int)idx],
+                    0, _vertical_resolution,
+                    _attack_start, _vertical_resolution);
+            }
+            else if (delta < _attack_plus_decay)
+            { // Decay
+                // Time since start of decay
+                delta -= _attack;
+
+                if (_decay > 0)
+                {
+                    uint32_t idx = (delta * _decay_scale_q6) >> 6;
+                    if (idx >= ARRAY_SIZE)
+                        idx = ARRAY_SIZE - 1;
+
+                    _adsr_output = map(
+                        _curve_tables[_bezier_decay_type][(int)idx],
+                        0, _vertical_resolution,
+                        _sustain, _vertical_resolution);
+                }
+                else
+                {
+                    _adsr_output = _sustain;
+                }
             }
             else
                 _adsr_output = _sustain;
         }
-        if (_t_note_off > _t_note_on)
+        else if (_t_note_off > _t_note_on)
         { // if note not pressed
             delta = l_millis - _t_note_off;
-            if (delta < _release) // release
-                _adsr_output = map(_curve_tables[_bezier_release_type][(int)floor((float)ARRAY_SIZE * (float)delta / (float)_release)], 0, _vertical_resolution, 0, _release_start);
+            if ((delta < _release) && (_release > 0)) // release
+            {
+                uint32_t idx = (delta * _release_scale_q6) >> 6;
+                if (idx >= ARRAY_SIZE)
+                    idx = ARRAY_SIZE - 1;
+
+                _adsr_output = map(
+                    _curve_tables[_bezier_release_type][(int)idx],
+                    0, _vertical_resolution,
+                    0, _release_start);
+            }
             else
                 _adsr_output = 0; // note off
         }
@@ -240,6 +316,12 @@ private:
     int _sustain = 0;           // 0 to -60dB -> then -inf
     unsigned long _release = 0; // 1ms to 60 sec
     bool _reset_attack = false; // if _reset_attack is "true" a new trigger starts with 0, if _reset_attack is false it starts with the current output value
+
+    // Cached sums and precomputed fixed-point (Q6) scales for fast time->index conversion
+    unsigned long _attack_plus_decay = 0;
+    uint32_t _attack_scale_q6 = 0;
+    uint32_t _decay_scale_q6 = 0;
+    uint32_t _release_scale_q6 = 0;
 
     // time stamp for note on and note off
     unsigned long _t_note_on = 0;
