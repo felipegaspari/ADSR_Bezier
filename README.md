@@ -197,39 +197,8 @@ Key parts of `adsr.h` (simplified):
 #define ADSR_1_DACSIZE 4000
 #define ARRAY_SIZE 512
 
-// Global Bézier tables (8 curves × ARRAY_SIZE points)
-int _curve0_table[ARRAY_SIZE];
-int _curve1_table[ARRAY_SIZE];
-int _curve2_table[ARRAY_SIZE];
-int _curve3_table[ARRAY_SIZE];
-int _curve4_table[ARRAY_SIZE];
-int _curve5_table[ARRAY_SIZE];
-int _curve6_table[ARRAY_SIZE];
-int _curve7_table[ARRAY_SIZE];
-
-int* _curve_tables[8] = {
-  _curve0_table, _curve1_table, _curve2_table, _curve3_table,
-  _curve4_table, _curve5_table, _curve6_table, _curve7_table
-};
-
+// ADSR Bezier library (provides global curve tables and ADSR class)
 #include "src/ADSR_Bezier/ADSR_Bezier.h"
-
-// Bézier generation function (runs at startup)
-void adsrCreateTables(float maxVal, int numPoints) {
-  Point A = { 0, maxVal };
-  Point B = { maxVal, 0 };
-  Point P1[8] = { /* control points */ };
-  Point P2[8] = { /* control points */ };
-
-  for (int j = 0; j < 8; j++) {
-    float multiplier = (float)(maxVal + 1) / (float)(numPoints - 1);
-    for (float i = 0; i < numPoints; i++) {
-      float xTarget = multiplier * i;
-      float yResult = findYForX(A, P1[j], P2[j], B, xTarget);
-      _curve_tables[j][(int)i] = (int)round(yResult);
-    }
-  }
-}
 
 // Per-voice ADSR instances
 adsr adsr1_voice_0(ADSR_1_DACSIZE, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
@@ -240,14 +209,15 @@ adsr adsr1_voice_3(ADSR_1_DACSIZE, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
 
 Notes:
 
-- `adsrCreateTables()` is called once at startup to fill `_curve_tables` with Bézier curves (8 types).
+- The ADSR Bezier library now owns the global Bézier tables and their generation.
 - Each voice has its own `adsr` instance with `vertical_resolution = 4000`.
 
 ### 5.2. Initialization (`adsr.ino`)
 
 ```cpp
 void init_ADSR() {
-  adsrCreateTables(ADSR_1_CC, ARRAY_SIZE);
+  // Initialize ADSR Bézier lookup tables in the library
+  adsrBezierInitTables(ADSR_1_CC, ARRAY_SIZE, _curve_tables);
 
   for (int i = 0; i < LIN_TO_EXP_TABLE_SIZE; i++) {
     linToLogLookup[i] = linearToLogarithmic(i, 10, maxADSRControlValue);

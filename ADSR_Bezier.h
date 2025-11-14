@@ -32,6 +32,9 @@
 // #define ATTACK_ALPHA 0.9975           // varies between 0.9 (steep curve) and 0.9995 (straight line)
 // #define ATTACK_DECAY_RELEASE 0.9975
 
+// Global curve table pointer (defined later in this header)
+extern int *_curve_tables[8];
+
 // Midi trigger -> on/off
 class adsr
 {
@@ -484,5 +487,114 @@ private:
     int _attack_start;
     int _notes_pressed = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Bézier table generation helpers
+// ---------------------------------------------------------------------------
+
+// Global Bézier lookup tables shared by all ADSR instances.
+// ARRAY_SIZE is provided by the including project before this header.
+int _curve0_table[ARRAY_SIZE];
+int _curve1_table[ARRAY_SIZE];
+int _curve2_table[ARRAY_SIZE];
+int _curve3_table[ARRAY_SIZE];
+int _curve4_table[ARRAY_SIZE];
+int _curve5_table[ARRAY_SIZE];
+int _curve6_table[ARRAY_SIZE];
+int _curve7_table[ARRAY_SIZE];
+
+int *_curve_tables[8] = {
+    _curve0_table, _curve1_table, _curve2_table, _curve3_table,
+    _curve4_table, _curve5_table, _curve6_table, _curve7_table};
+
+// Lightweight point type used for table generation
+struct ADSRBezierPoint
+{
+    float x, y;
+};
+
+// Evaluate a cubic Bézier at parameter t in [0, 1]
+inline ADSRBezierPoint adsrBezierCubic(const ADSRBezierPoint &A,
+                                       const ADSRBezierPoint &P1,
+                                       const ADSRBezierPoint &P2,
+                                       const ADSRBezierPoint &B,
+                                       float t)
+{
+    float one_minus_t = 1.0f - t;
+    float one_minus_t_squared = one_minus_t * one_minus_t;
+    float t_squared = t * t;
+
+    float x = one_minus_t_squared * one_minus_t * A.x +
+              3.0f * one_minus_t_squared * t * P1.x +
+              3.0f * one_minus_t * t_squared * P2.x +
+              t_squared * t * B.x;
+
+    float y = one_minus_t_squared * one_minus_t * A.y +
+              3.0f * one_minus_t_squared * t * P1.y +
+              3.0f * one_minus_t * t_squared * P2.y +
+              t_squared * t * B.y;
+
+    return {x, y};
+}
+
+// Find y for a given x on the cubic Bézier using binary search on t
+inline float adsrBezierFindYForX(const ADSRBezierPoint &A,
+                                 const ADSRBezierPoint &P1,
+                                 const ADSRBezierPoint &P2,
+                                 const ADSRBezierPoint &B,
+                                 float xTarget,
+                                 float tol = 1e-5f)
+{
+    float tLow = 0.0f;
+    float tHigh = 1.0f;
+    float tMid = 0.0f;
+
+    while ((tHigh - tLow) > tol)
+    {
+        tMid = (tLow + tHigh) * 0.5f;
+        ADSRBezierPoint midPoint = adsrBezierCubic(A, P1, P2, B, tMid);
+        if (midPoint.x < xTarget)
+        {
+            tLow = tMid;
+        }
+        else
+        {
+            tHigh = tMid;
+        }
+    }
+
+    ADSRBezierPoint resultPoint = adsrBezierCubic(A, P1, P2, B, tMid);
+    return resultPoint.y;
+}
+
+// Generate 8 Bézier curves into the provided curve_tables (size [8][numPoints])
+// maxVal: maximum y value (e.g. vertical_resolution)
+// numPoints: number of points per curve (ARRAY_SIZE)
+inline void adsrBezierInitTables(float maxVal, int numPoints, int *curve_tables[8])
+{
+    ADSRBezierPoint A = {0.0f, maxVal};
+    ADSRBezierPoint B = {maxVal, 0.0f};
+
+    ADSRBezierPoint P1[8] = {
+        {250.0f, 1500.0f}, {840.0f, 1780.0f}, {400.0f, 430.0f},  {2170.0f, 3610.0f},
+        {400.0f, 1380.0f}, {1140.0f, 3750.0f}, {200.0f, 2700.0f}, {0.0f, 4095.0f}};
+
+    ADSRBezierPoint P2[8] = {
+        {1500.0f, 250.0f}, {1160.0f, 210.0f}, {920.0f, 420.0f},  {3730.0f, 2610.0f},
+        {3830.0f, 2890.0f}, {1850.0f, 1080.0f}, {720.0f, 3050.0f}, {4095.0f, 0.0f}};
+
+    for (int j = 0; j < 8; ++j)
+    {
+        float multiplier = (float)(maxVal + 1.0f) / (float)(numPoints - 1);
+
+        for (int i = 0; i < numPoints; ++i)
+        {
+            float xTarget = multiplier * (float)i;
+            float yResult = adsrBezierFindYForX(A, P1[j], P2[j], B, xTarget);
+
+            curve_tables[j][i] = (int)roundf(yResult);
+        }
+    }
+}
 
 #endif
