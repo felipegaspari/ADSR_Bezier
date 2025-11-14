@@ -5,7 +5,8 @@
 // last update: 14.08.2022
 //----------------------------------//
 
-// #include "Arduino.h"
+// Use Arduino timing functions (millis) internally
+#include "Arduino.h"
 // #include <math.h>
 
 #ifndef ADSR
@@ -175,9 +176,11 @@ public:
         }
     }
 
-    void noteOn(unsigned long l_millis)
+    // Use current millis() timestamp internally
+    void noteOn()
     {
-        _t_note_on = l_millis; // set new timestamp for note_on
+        unsigned long now = millis();
+        _t_note_on = now; // set new timestamp for note_on
         if (_reset_attack)     // set start value new Attack
             _attack_start = 0; // if _reset_attack equals true, a new trigger starts with 0
         else
@@ -185,19 +188,22 @@ public:
         _notes_pressed++;                 // increase number of pressed notes with one
     }
 
-    void noteOff(unsigned long l_millis)
+    void noteOff()
     {
         _notes_pressed--;
         if (_notes_pressed <= 0)
         {                                  // if all notes are depressed - start release
-            _t_note_off = l_millis;        // set timestamp for note off
+            unsigned long now = millis();
+            _t_note_off = now;             // set timestamp for note off
             _release_start = _adsr_output; // set start value for release
             _notes_pressed = 0;
         }
     }
 
-    int getWave(unsigned long l_millis)
+    // Compute ADSR value based on current millis()
+    int getWave()
     {
+        unsigned long l_millis = millis();
         unsigned long delta = 0;
 
         if (_t_note_off < _t_note_on)
