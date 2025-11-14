@@ -5,7 +5,15 @@
 // last update: 14.08.2022
 //----------------------------------//
 
-// #include "Arduino.h"
+// Use Arduino timing functions internally
+#include "Arduino.h"
+
+// Select timebase:
+// 1 -> use micros() internally (high resolution)
+// 0 -> use millis() internally (backwards-compatible behavior)
+#ifndef ADSR_BEZIER_USE_MICROS
+#define ADSR_BEZIER_USE_MICROS 1
+#endif
 // #include <math.h>
 
 #ifndef ADSR
@@ -115,14 +123,54 @@ public:
         _reset_attack = l_reset_attack;
     }
 
-    void setAttack(unsigned long l_attack)
+    // Attack time in milliseconds (same external semantics as millis-based ADSR)
+    void setAttack(unsigned long l_attack_ms)
     {
-        _attack = l_attack;
+        // Convert to internal timebase (ticks)
+#if ADSR_BEZIER_USE_MICROS
+        unsigned long attack_ticks = l_attack_ms * 1000UL; // µs
+#else
+        unsigned long attack_ticks = l_attack_ms;          // ms
+#endif
+        _attack = attack_ticks;
+
+        // Precompute fixed-point scale for fast time->index mapping (Q24 format)
+        // idx ~= delta_us * ((ARRAY_SIZE-1) / _attack)
+        if (_attack > 0 && _attack <= _time_q24_max_ticks)
+        {
+            _attack_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_attack;
+        }
+        else
+        {
+            _attack_scale_q24 = 0;
+        }
+
+        // Keep cached sum for faster stage checks in getWave()
+        _attack_plus_decay = _attack + _decay;
     }
 
-    void setDecay(unsigned long l_decay)
+    // Decay time in milliseconds
+    void setDecay(unsigned long l_decay_ms)
     {
-        _decay = l_decay;
+        // Convert to internal timebase (ticks)
+#if ADSR_BEZIER_USE_MICROS
+        unsigned long decay_ticks = l_decay_ms * 1000UL; // µs
+#else
+        unsigned long decay_ticks = l_decay_ms;          // ms
+#endif
+        _decay = decay_ticks;
+
+        if (_decay > 0 && _decay <= _time_q24_max_ticks)
+        {
+            _decay_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_decay;
+        }
+        else
+        {
+            _decay_scale_q24 = 0;
+        }
+
+        // Keep cached sum for faster stage checks in getWave()
+        _attack_plus_decay = _attack + _decay;
     }
 
     void setSustain(int l_sustain)
@@ -132,55 +180,220 @@ public:
         if (l_sustain >= _vertical_resolution)
             l_sustain = _vertical_resolution;
         _sustain = l_sustain;
+
+        // Precompute decay output range scale: from sustain up to full level
+        // out = sustain + curveVal * (vertical_resolution - sustain) / vertical_resolution
+        int32_t range = (int32_t)_vertical_resolution - (int32_t)_sustain;
+        if (range < 0)
+            range = 0;
+        if (_vertical_resolution > 0)
+        {
+            _decay_range_scale_q16 = (int32_t)(((int32_t)range << 16) / _vertical_resolution);
+        }
+        else
+        {
+            _decay_range_scale_q16 = 0;
+        }
     }
 
-    void setRelease(unsigned long l_release)
+    // Release time in milliseconds
+    void setRelease(unsigned long l_release_ms)
     {
-        _release = l_release;
+        // Convert to internal timebase (ticks)
+#if ADSR_BEZIER_USE_MICROS
+        unsigned long release_ticks = l_release_ms * 1000UL; // µs
+#else
+        unsigned long release_ticks = l_release_ms;          // ms
+#endif
+        _release = release_ticks;
+
+        if (_release > 0 && _release <= _time_q24_max_ticks)
+        {
+            _release_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_release;
+        }
+        else
+        {
+            _release_scale_q24 = 0;
+        }
     }
 
-    void noteOn(unsigned long l_micros)
+    // Use current micros() timestamp internally
+    void noteOn()
     {
-        _t_note_on = l_micros; // set new timestamp for note_on
+        unsigned long now;
+#if ADSR_BEZIER_USE_MICROS
+        now = micros();
+#else
+        now = millis();
+#endif
+        _t_note_on = now; // set new timestamp for note_on
         if (_reset_attack)     // set start value new Attack
             _attack_start = 0; // if _reset_attack equals true, a new trigger starts with 0
         else
             _attack_start = _adsr_output; // if _reset_attack equals false, a new trigger starts with the current value
         _notes_pressed++;                 // increase number of pressed notes with one
+
+        // Precompute attack output range scale: from attack_start up to full level
+        // out = attack_start + curveVal * (vertical_resolution - attack_start) / vertical_resolution
+        int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
+        if (range < 0)
+            range = 0;
+        if (_vertical_resolution > 0)
+        {
+            _attack_range_scale_q16 = (int32_t)(((int32_t)range << 16) / _vertical_resolution);
+        }
+        else
+        {
+            _attack_range_scale_q16 = 0;
+        }
     }
 
-    void noteOff(unsigned long l_micros)
+    void noteOff()
     {
         _notes_pressed--;
         if (_notes_pressed <= 0)
         {                                  // if all notes are depressed - start release
-            _t_note_off = l_micros;        // set timestamp for note off
+            unsigned long now;
+#if ADSR_BEZIER_USE_MICROS
+            now = micros();
+#else
+            now = millis();
+#endif
+            _t_note_off = now;             // set timestamp for note off
             _release_start = _adsr_output; // set start value for release
             _notes_pressed = 0;
+
+            // Precompute release output range scale: from release_start down to 0
+            // out = curveVal * release_start / vertical_resolution
+            int32_t rs = (int32_t)_release_start;
+            if (rs < 0)
+                rs = 0;
+            if (rs > _vertical_resolution)
+                rs = _vertical_resolution;
+            if (_vertical_resolution > 0)
+            {
+                _release_range_scale_q16 = (int32_t)((rs << 16) / _vertical_resolution);
+            }
+            else
+            {
+                _release_range_scale_q16 = 0;
+            }
         }
     }
 
-    int getWave(unsigned long l_micros)
+    // Compute ADSR value based on current timebase (micros or millis)
+    int getWave()
     {
+        unsigned long l_ticks;
+#if ADSR_BEZIER_USE_MICROS
+        l_ticks = micros();
+#else
+        l_ticks = millis();
+#endif
         unsigned long delta = 0;
+
         if (_t_note_off < _t_note_on)
         { // if note is pressed
-            delta = l_micros - _t_note_on;
-            if (delta < _attack)                                                                                                                                                                            // Attack
-                _adsr_output = map(_curve_tables[_bezier_attack_type][ARRAY_SIZE - (int)floor((float)ARRAY_SIZE * (float)delta / (float)_attack)], 0, _vertical_resolution, _attack_start, _vertical_resolution); //
-            else if (delta < _attack + _decay)
-            { // Decays
-                delta = l_micros - _t_note_on - _attack;
-                _adsr_output = map(_curve_tables[_bezier_decay_type][(int)floor((float)ARRAY_SIZE * (float)delta / (float)_decay)], 0, _vertical_resolution, _sustain, _vertical_resolution);
+            // Total time since note on (in internal ticks)
+            delta = l_ticks - _t_note_on;
+
+            // Attack
+            if ((delta < _attack) && (_attack > 0))
+            {
+                uint32_t idx;
+                if (_attack <= _time_q24_max_ticks && _attack_scale_q24 != 0)
+                {
+                    // Integer time->index mapping using precomputed Q24 scale:
+                    // idx ~= delta_us * ((ARRAY_SIZE-1) / _attack)
+                    idx = (uint32_t)(((uint64_t)delta * _attack_scale_q24) >> 24);
+                }
+                else
+                {
+                    // Exact integer time->index mapping using 64-bit math:
+                    // idx = (ARRAY_SIZE-1) * delta / _attack
+                    idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_attack);
+                }
+                if (idx >= ARRAY_SIZE)
+                    idx = ARRAY_SIZE - 1;
+
+                // Attack curve runs "backwards" through the table
+                int curveVal = _curve_tables[_bezier_attack_type][(ARRAY_SIZE - 1) - (int)idx];
+
+                // Fast integer mapping to output using precomputed Q16 scale
+                // out = attack_start + curveVal * (vertical_resolution - attack_start) / vertical_resolution
+                int32_t out = (int32_t)_attack_start +
+                              (int32_t)(((int32_t)curveVal * _attack_range_scale_q16) >> 16);
+                if (out < 0)
+                    out = 0;
+                if (out > _vertical_resolution)
+                    out = _vertical_resolution;
+                _adsr_output = (int)out;
+            }
+            else if (delta < _attack_plus_decay)
+            { // Decay
+                // Time since start of decay
+                delta -= _attack;
+
+                if (_decay > 0)
+                {
+                    uint32_t idx;
+                    if (_decay <= _time_q24_max_ticks && _decay_scale_q24 != 0)
+                    {
+                        idx = (uint32_t)(((uint64_t)delta * _decay_scale_q24) >> 24);
+                    }
+                    else
+                    {
+                        idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_decay);
+                    }
+                    if (idx >= ARRAY_SIZE)
+                        idx = ARRAY_SIZE - 1;
+
+                    int curveVal = _curve_tables[_bezier_decay_type][(int)idx];
+
+                    // out = sustain + curveVal * (vertical_resolution - sustain) / vertical_resolution
+                    int32_t out = (int32_t)_sustain +
+                                  (int32_t)(((int32_t)curveVal * _decay_range_scale_q16) >> 16);
+                    if (out < 0)
+                        out = 0;
+                    if (out > _vertical_resolution)
+                        out = _vertical_resolution;
+                    _adsr_output = (int)out;
+                }
+                else
+                {
+                    _adsr_output = _sustain;
+                }
             }
             else
                 _adsr_output = _sustain;
         }
-        if (_t_note_off > _t_note_on)
+        else if (_t_note_off > _t_note_on)
         { // if note not pressed
-            delta = l_micros - _t_note_off;
-            if (delta < _release) // release
-                _adsr_output = map(_curve_tables[_bezier_release_type][(int)floor((float)ARRAY_SIZE * (float)delta / (float)_release)], 0, _vertical_resolution, 0, _release_start);
+            delta = l_ticks - _t_note_off;
+            if ((delta < _release) && (_release > 0)) // release
+            {
+                uint32_t idx;
+                if (_release <= _time_q24_max_ticks && _release_scale_q24 != 0)
+                {
+                    idx = (uint32_t)(((uint64_t)delta * _release_scale_q24) >> 24);
+                }
+                else
+                {
+                    idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_release);
+                }
+                if (idx >= ARRAY_SIZE)
+                    idx = ARRAY_SIZE - 1;
+
+                int curveVal = _curve_tables[_bezier_release_type][(int)idx];
+
+                // out = curveVal * release_start / vertical_resolution
+                int32_t out = (int32_t)(((int32_t)curveVal * _release_range_scale_q16) >> 16);
+                if (out < 0)
+                    out = 0;
+                if (out > _vertical_resolution)
+                    out = _vertical_resolution;
+                _adsr_output = (int)out;
+            }
             else
                 _adsr_output = 0; // note off
         }
@@ -235,11 +448,31 @@ private:
     int _bezier_release_type;
 
     int _vertical_resolution;   // number of bits for output, control, etc
-    unsigned long _attack = 0;  // 0 to 20 sec
-    unsigned long _decay = 0;   // 1ms to 60 sec
+    unsigned long _attack = 0;  // 0 to 20 sec (in microseconds)
+    unsigned long _decay = 0;   // 1ms to 60 sec  (in microseconds)
     int _sustain = 0;           // 0 to -60dB -> then -inf
-    unsigned long _release = 0; // 1ms to 60 sec
+    unsigned long _release = 0; // 1ms to 60 sec (in microseconds)
     bool _reset_attack = false; // if _reset_attack is "true" a new trigger starts with 0, if _reset_attack is false it starts with the current output value
+
+    // Threshold for using Q24 fixed-point vs exact division (in internal ticks)
+#if ADSR_BEZIER_USE_MICROS
+    static constexpr unsigned long _time_q24_max_ticks = 2000000UL; // 2 seconds in µs
+#else
+    static constexpr unsigned long _time_q24_max_ticks = 2000UL;    // 2 seconds in ms
+#endif
+
+    // Cached sum for fast stage checks in getWave()
+    unsigned long _attack_plus_decay = 0;
+
+    // Precomputed fixed-point (Q24) scales for fast time->index conversion
+    uint64_t _attack_scale_q24 = 0;
+    uint64_t _decay_scale_q24  = 0;
+    uint64_t _release_scale_q24 = 0;
+
+    // Precomputed fixed-point (Q16) scales for fast curve->output mapping
+    int32_t _attack_range_scale_q16 = 0;
+    int32_t _decay_range_scale_q16 = 0;
+    int32_t _release_range_scale_q16 = 0;
 
     // time stamp for note on and note off
     unsigned long _t_note_on = 0;
