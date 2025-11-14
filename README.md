@@ -319,16 +319,28 @@ This happens once at startup and uses `float`, but it’s out of the runtime hot
 
 ### 6.2. Time → table index
 
+The ADSR runs as a small state machine with an explicit phase and phase‑start time:
+
+- `ADSR_PHASE_ATTACK`
+- `ADSR_PHASE_DECAY`
+- `ADSR_PHASE_SUSTAIN`
+- `ADSR_PHASE_RELEASE`
+- `ADSR_PHASE_IDLE`
+
 For each call to `getWave()`:
 
-1. Compute `delta = now - t_note_on` or `now - t_note_off` in **ticks** (µs or ms).
-2. Depending on the parameter time and Q24 threshold:
+1. Read the current time in **ticks** (µs or ms) and compute `delta = now - t_phase_start` for the current phase.
+2. **Realtime within phase, isolated across phases**:
+   - Attack index uses the current `attack` time; changing `attack` while in ATTACK morphs the remaining attack, but does not affect DECAY/RELEASE.
+   - Decay index uses the current `decay` time; changing `decay` while in DECAY morphs the remaining decay, but does not affect RELEASE.
+   - Release index uses the current `release` time; changing `release` while in RELEASE morphs the tail, but earlier phases are unaffected.
+3. Depending on the phase’s (current) time and Q24 threshold:
    - **Q24 path (fast)** for shorter times:  
      `idx ≈ (delta * scale_q24) >> 24`  
-     where `scale_q24` was precomputed from the A/D/R time in the corresponding setter.
+     where `scale_q24` was precomputed from the active A/D/R time in the corresponding setter.
    - **Exact path (accurate)** for long times:  
      `idx = ((ARRAY_SIZE - 1) * delta) / time_ticks`.
-3. Clamp `idx` to `[0, ARRAY_SIZE-1]`.
+4. Clamp `idx` to `[0, ARRAY_SIZE-1]`.
 
 ### 6.3. Table → output level
 

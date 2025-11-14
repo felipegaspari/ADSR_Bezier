@@ -138,7 +138,7 @@ public:
         _attack = attack_ticks;
 
         // Precompute fixed-point scale for fast time->index mapping (Q24 format)
-        // idx ~= delta_us * ((ARRAY_SIZE-1) / _attack)
+        // idx ~= delta_ticks * ((ARRAY_SIZE-1) / _attack)
         if (_attack > 0 && _attack <= _time_q24_max_ticks)
         {
             _attack_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_attack;
@@ -147,9 +147,6 @@ public:
         {
             _attack_scale_q24 = 0;
         }
-
-        // Keep cached sum for faster stage checks in getWave()
-        _attack_plus_decay = _attack + _decay;
     }
 
     // Decay time in milliseconds
@@ -171,9 +168,6 @@ public:
         {
             _decay_scale_q24 = 0;
         }
-
-        // Keep cached sum for faster stage checks in getWave()
-        _attack_plus_decay = _attack + _decay;
     }
 
     void setSustain(int l_sustain)
@@ -236,6 +230,10 @@ public:
             _attack_start = _adsr_output; // if _reset_attack equals false, a new trigger starts with the current value
         _notes_pressed++;                 // increase number of pressed notes with one
 
+        // Start attack phase
+        _phase = ADSR_PHASE_ATTACK;
+        _t_phase_start = now;
+
         // Precompute attack output range scale: from attack_start up to full level
         // out = attack_start + curveVal * (vertical_resolution - attack_start) / vertical_resolution
         int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
@@ -266,6 +264,10 @@ public:
             _release_start = _adsr_output; // set start value for release
             _notes_pressed = 0;
 
+            // Start release phase
+            _phase = ADSR_PHASE_RELEASE;
+            _t_phase_start = now;
+
             // Precompute release output range scale: from release_start down to 0
             // out = curveVal * release_start / vertical_resolution
             int32_t rs = (int32_t)_release_start;
@@ -295,110 +297,168 @@ public:
 #endif
         unsigned long delta = 0;
 
-        if (_t_note_off < _t_note_on)
-        { // if note is pressed
-            // Total time since note on (in internal ticks)
-            delta = l_ticks - _t_note_on;
-
-            // Attack
-            if ((delta < _attack) && (_attack > 0))
+        switch (_phase)
+        {
+        case ADSR_PHASE_ATTACK:
+        {
+            if (_attack == 0)
             {
-                uint32_t idx;
-                if (_attack <= _time_q24_max_ticks && _attack_scale_q24 != 0)
-                {
-                    // Integer time->index mapping using precomputed Q24 scale:
-                    // idx ~= delta_us * ((ARRAY_SIZE-1) / _attack)
-                    idx = (uint32_t)(((uint64_t)delta * _attack_scale_q24) >> 24);
-                }
-                else
-                {
-                    // Exact integer time->index mapping using 64-bit math:
-                    // idx = (ARRAY_SIZE-1) * delta / _attack
-                    idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_attack);
-                }
-                if (idx >= ARRAY_SIZE)
-                    idx = ARRAY_SIZE - 1;
-
-                // Attack curve runs "backwards" through the table
-                int curveVal = _curve_tables[_bezier_attack_type][(ARRAY_SIZE - 1) - (int)idx];
-
-                // Fast integer mapping to output using precomputed Q16 scale
-                // out = attack_start + curveVal * (vertical_resolution - attack_start) / vertical_resolution
-                int32_t out = (int32_t)_attack_start +
-                              (int32_t)(((int32_t)curveVal * _attack_range_scale_q16) >> 16);
-                if (out < 0)
-                    out = 0;
-                if (out > _vertical_resolution)
-                    out = _vertical_resolution;
-                _adsr_output = (int)out;
-            }
-            else if (delta < _attack_plus_decay)
-            { // Decay
-                // Time since start of decay
-                delta -= _attack;
-
+                // Immediate attack -> go to next phase
+                _adsr_output = _vertical_resolution;
                 if (_decay > 0)
                 {
-                    uint32_t idx;
-                    if (_decay <= _time_q24_max_ticks && _decay_scale_q24 != 0)
-                    {
-                        idx = (uint32_t)(((uint64_t)delta * _decay_scale_q24) >> 24);
-                    }
-                    else
-                    {
-                        idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_decay);
-                    }
-                    if (idx >= ARRAY_SIZE)
-                        idx = ARRAY_SIZE - 1;
-
-                    int curveVal = _curve_tables[_bezier_decay_type][(int)idx];
-
-                    // out = sustain + curveVal * (vertical_resolution - sustain) / vertical_resolution
-                    int32_t out = (int32_t)_sustain +
-                                  (int32_t)(((int32_t)curveVal * _decay_range_scale_q16) >> 16);
-                    if (out < 0)
-                        out = 0;
-                    if (out > _vertical_resolution)
-                        out = _vertical_resolution;
-                    _adsr_output = (int)out;
+                    _phase = ADSR_PHASE_DECAY;
+                    _t_phase_start = l_ticks;
                 }
                 else
                 {
-                    _adsr_output = _sustain;
+                    _phase = ADSR_PHASE_SUSTAIN;
                 }
+                break;
             }
-            else
-                _adsr_output = _sustain;
-        }
-        else if (_t_note_off > _t_note_on)
-        { // if note not pressed
-            delta = l_ticks - _t_note_off;
-            if ((delta < _release) && (_release > 0)) // release
+
+            delta = l_ticks - _t_phase_start;
+
+            if (delta >= _attack)
             {
-                uint32_t idx;
-                if (_release <= _time_q24_max_ticks && _release_scale_q24 != 0)
+                // End of attack -> full level
+                _adsr_output = _vertical_resolution;
+                if (_decay > 0)
                 {
-                    idx = (uint32_t)(((uint64_t)delta * _release_scale_q24) >> 24);
+                    _phase = ADSR_PHASE_DECAY;
+                    _t_phase_start = l_ticks;
                 }
                 else
                 {
-                    idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_release);
+                    _phase = ADSR_PHASE_SUSTAIN;
                 }
-                if (idx >= ARRAY_SIZE)
-                    idx = ARRAY_SIZE - 1;
+                break;
+            }
 
-                int curveVal = _curve_tables[_bezier_release_type][(int)idx];
-
-                // out = curveVal * release_start / vertical_resolution
-                int32_t out = (int32_t)(((int32_t)curveVal * _release_range_scale_q16) >> 16);
-                if (out < 0)
-                    out = 0;
-                if (out > _vertical_resolution)
-                    out = _vertical_resolution;
-                _adsr_output = (int)out;
+            // Time->index mapping for attack
+            uint32_t idx;
+            if (_attack > 0 && _attack <= _time_q24_max_ticks && _attack_scale_q24 != 0)
+            {
+                idx = (uint32_t)(((uint64_t)delta * _attack_scale_q24) >> 24);
             }
             else
-                _adsr_output = 0; // note off
+            {
+                idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_attack);
+            }
+            if (idx >= ARRAY_SIZE)
+                idx = ARRAY_SIZE - 1;
+
+            // Attack curve runs "backwards" through the table
+            int curveVal = _curve_tables[_bezier_attack_type][(ARRAY_SIZE - 1) - (int)idx];
+
+            // Map to output
+            int32_t out = (int32_t)_attack_start +
+                          (int32_t)(((int32_t)curveVal * _attack_range_scale_q16) >> 16);
+            if (out < 0)
+                out = 0;
+            if (out > _vertical_resolution)
+                out = _vertical_resolution;
+            _adsr_output = (int)out;
+            break;
+        }
+
+        case ADSR_PHASE_DECAY:
+        {
+            if (_decay == 0)
+            {
+                // Immediate decay -> sustain
+                _adsr_output = _sustain;
+                _phase = ADSR_PHASE_SUSTAIN;
+                break;
+            }
+
+            delta = l_ticks - _t_phase_start;
+
+            if (delta >= _decay)
+            {
+                // End of decay -> sustain
+                _adsr_output = _sustain;
+                _phase = ADSR_PHASE_SUSTAIN;
+                break;
+            }
+
+            uint32_t idx;
+            if (_decay > 0 && _decay <= _time_q24_max_ticks && _decay_scale_q24 != 0)
+            {
+                idx = (uint32_t)(((uint64_t)delta * _decay_scale_q24) >> 24);
+            }
+            else
+            {
+                idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_decay);
+            }
+            if (idx >= ARRAY_SIZE)
+                idx = ARRAY_SIZE - 1;
+
+            int curveVal = _curve_tables[_bezier_decay_type][(int)idx];
+
+            int32_t out = (int32_t)_sustain +
+                          (int32_t)(((int32_t)curveVal * _decay_range_scale_q16) >> 16);
+            if (out < 0)
+                out = 0;
+            if (out > _vertical_resolution)
+                out = _vertical_resolution;
+            _adsr_output = (int)out;
+            break;
+        }
+
+        case ADSR_PHASE_SUSTAIN:
+        {
+            _adsr_output = _sustain;
+            break;
+        }
+
+        case ADSR_PHASE_RELEASE:
+        {
+            if (_release == 0)
+            {
+                _adsr_output = 0;
+                _phase = ADSR_PHASE_IDLE;
+                break;
+            }
+
+            delta = l_ticks - _t_phase_start;
+
+            if (delta >= _release)
+            {
+                _adsr_output = 0;
+                _phase = ADSR_PHASE_IDLE;
+                break;
+            }
+
+            uint32_t idx;
+            if (_release > 0 && _release <= _time_q24_max_ticks && _release_scale_q24 != 0)
+            {
+                idx = (uint32_t)(((uint64_t)delta * _release_scale_q24) >> 24);
+            }
+            else
+            {
+                idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_release);
+            }
+            if (idx >= ARRAY_SIZE)
+                idx = ARRAY_SIZE - 1;
+
+            int curveVal = _curve_tables[_bezier_release_type][(int)idx];
+
+            int32_t out = (int32_t)(((int32_t)curveVal * _release_range_scale_q16) >> 16);
+            if (out < 0)
+                out = 0;
+            if (out > _vertical_resolution)
+                out = _vertical_resolution;
+            _adsr_output = (int)out;
+            break;
+        }
+
+        case ADSR_PHASE_IDLE:
+        default:
+        {
+            _adsr_output = 0;
+            break;
+        }
         }
         return _adsr_output;
     }
@@ -464,13 +524,25 @@ private:
     static constexpr unsigned long _time_q24_max_ticks = 2000UL;    // 2 seconds in ms
 #endif
 
-    // Cached sum for fast stage checks in getWave()
-    unsigned long _attack_plus_decay = 0;
-
     // Precomputed fixed-point (Q24) scales for fast time->index conversion
     uint64_t _attack_scale_q24 = 0;
     uint64_t _decay_scale_q24  = 0;
     uint64_t _release_scale_q24 = 0;
+
+    // Internal ADSR phase state
+    enum ADSRPhase
+    {
+        ADSR_PHASE_IDLE = 0,
+        ADSR_PHASE_ATTACK,
+        ADSR_PHASE_DECAY,
+        ADSR_PHASE_SUSTAIN,
+        ADSR_PHASE_RELEASE
+    };
+
+    ADSRPhase _phase = ADSR_PHASE_IDLE;
+
+    // Phase start time (ticks) for the current stage
+    unsigned long _t_phase_start = 0;
 
     // Precomputed fixed-point (Q16) scales for fast curve->output mapping
     int32_t _attack_range_scale_q16 = 0;
