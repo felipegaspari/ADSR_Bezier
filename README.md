@@ -1,9 +1,10 @@
-## ADSR Bezier (millis/micros, RP2040‑friendly)
+## ADSR Bezier (millis/micros, dual math backend)
 
 ADSR Bezier is a lightweight, digitally‑controlled envelope generator based on precomputed Bézier lookup tables.  
 It is designed to be:
 
-- **Fast at runtime** (integer math only in the hot path, RP2040‑friendly).
+- **Fast at runtime** (fixed-point Q24/Q16 by default, RP2040‑friendly).
+- **Portable** (optional float hot path via `ADSR_BEZIER_USE_FLOAT`).
 - **Flexible in timing** (supports both `millis()` and `micros()` timebases).
 - **Curve‑shaped** (attack/decay/release follow user‑defined Bézier curves).
 
@@ -19,9 +20,8 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 - **Class**: `adsr` (defined in `ADSR_Bezier.h`).
 - **Output**: integer envelope level from `0` to `vertical_resolution` (e.g. `0…4000`).
 - **Time parameters**: `attack`, `decay`, `release` are set in **milliseconds**.
-- **Timebase**:
-  - Internal timing can be **microseconds** (`micros()`) or **milliseconds** (`millis()`).
-  - Selected at compile time via `ADSR_BEZIER_USE_MICROS`.
+- **Timebase**: `ADSR_BEZIER_USE_MICROS` (micros vs millis).
+- **Math backend**: `ADSR_BEZIER_USE_FLOAT` (0 = fixed-point default, 1 = float hot path).
 - **Curves**:
   - Attack, decay and release each read from a Bézier‑generated lookup table.
   - 8 different curve types are supported (`0…7`), selected separately for A/D/R.
@@ -29,13 +29,37 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 Internally, each call to `getWave()`:
 
 1. Computes the elapsed time since `noteOn()` / `noteOff()` using the chosen timebase.
-2. Converts elapsed time to a **table index** using either:
-   - A precomputed Q24 fixed‑point scale (fast path, for shorter times), or
-   - Exact 64‑bit integer division (accurate path, for long times).
+2. Converts elapsed time to a **table index** (precomputed scale; fixed Q24 or float `floorf` depending on backend).
 3. Reads the appropriate table value for the current stage (attack/decay/release).
-4. Linearly maps that curve value to the requested output range using Q16 fixed‑point math.
+4. Linearly maps that curve value to the requested output range (Q16 fixed-point or float multiply).
 
-No floating‑point math or divisions are performed in the audio/control‑rate hot path.
+Divisions are precomputed in setters; the hot path has no runtime division.
+
+---
+
+## 1b. Math backend (`ADSR_BEZIER_USE_FLOAT`)
+
+Select at compile time before including the header:
+
+```cpp
+#define ADSR_BEZIER_USE_FLOAT 0   // default: Q24/Q16 fixed-point (RP2040)
+// #define ADSR_BEZIER_USE_FLOAT 1 // float index + range scales (FPU MCUs)
+#include "ADSR_Bezier.h"
+```
+
+| Value | Hot path | Best for |
+|-------|----------|----------|
+| `0` (default) | Q24 index + Q16 range | RP2040 / Cortex-M0+ without FPU |
+| `1` | float scale + `floorf` | Teensy 4, ESP32, STM32F4, RP2350 with FPU |
+
+**Branches:** `main` is canonical (dual backend). `fixed-point-version` and `float-version` are legacy aliases — use `main` with the define above.
+
+Host regression test:
+
+```bash
+cd examples/compare_fixed_float
+g++ -std=c++17 -O2 -o compare compare.cpp && ./compare
+```
 
 ---
 
@@ -334,12 +358,9 @@ For each call to `getWave()`:
    - Attack index uses the current `attack` time; changing `attack` while in ATTACK morphs the remaining attack, but does not affect DECAY/RELEASE.
    - Decay index uses the current `decay` time; changing `decay` while in DECAY morphs the remaining decay, but does not affect RELEASE.
    - Release index uses the current `release` time; changing `release` while in RELEASE morphs the tail, but earlier phases are unaffected.
-3. Depending on the phase’s (current) time and Q24 threshold:
-   - **Q24 path (fast)** for shorter times:  
-     `idx ≈ (delta * scale_q24) >> 24`  
-     where `scale_q24` was precomputed from the active A/D/R time in the corresponding setter.
-   - **Exact path (accurate)** for long times:  
-     `idx = ((ARRAY_SIZE - 1) * delta) / time_ticks`.
+3. Convert `delta` to a table index using the active backend:
+   - **Fixed (`ADSR_BEZIER_USE_FLOAT=0`):** Q24 fast path or uint64 division fallback.
+   - **Float (`ADSR_BEZIER_USE_FLOAT=1`):** `floor(delta * idx_scale)` with long-phase uint64 fallback.
 4. Clamp `idx` to `[0, ARRAY_SIZE-1]`.
 
 ### 6.3. Table → output level
@@ -355,18 +376,17 @@ Per stage (simplified):
 - **Release**:  
   `out = curveVal * release_start / vertical_resolution`
 
-These are implemented as Q16 fixed‑point multiplies and shifts with precomputed scales, so only integer math is used at runtime.
+These are implemented with precomputed range scales (Q16 or float) at setter/noteOn/noteOff time.
 
 ---
 
 ## 7. Tips for using the library
 
-- **For best quality**: use micros timebase and keep Q24 thresholds conservative (or disabled) if you use very long envelopes.
-- **For benchmarking**: set the Q24 threshold high to force Q24 over most of the range, and compare against a threshold of `0`.
-- **For other projects**:
-  - Reuse the `adsrCreateTables()` pattern to generate your own `_curve_tables`.
-  - Adjust `ARRAY_SIZE` for a resolution vs RAM trade‑off.
-  - Use `setResetAttack(true)` for percussive mono lines; `false` for legato behavior.
+- **For RP2040 / M0+:** keep `ADSR_BEZIER_USE_FLOAT` at `0` (default).
+- **For FPU targets:** set `ADSR_BEZIER_USE_FLOAT` to `1` to use the float hot path.
+- **For best quality:** use micros timebase (`ADSR_BEZIER_USE_MICROS=1`).
+- Adjust `ARRAY_SIZE` for resolution vs RAM trade-off.
+- Use `setResetAttack(true)` for percussive lines; `false` for legato.
 
 ---
 

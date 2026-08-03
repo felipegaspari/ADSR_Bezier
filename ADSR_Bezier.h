@@ -14,7 +14,15 @@
 #ifndef ADSR_BEZIER_USE_MICROS
 #define ADSR_BEZIER_USE_MICROS 1
 #endif
-// #include <math.h>
+
+// Math backend: 0 = Q24/Q16 fixed-point (RP2040 default), 1 = float hot path
+#ifndef ADSR_BEZIER_USE_FLOAT
+#define ADSR_BEZIER_USE_FLOAT 0
+#endif
+
+#if ADSR_BEZIER_USE_FLOAT
+#include <math.h>
+#endif
 
 #ifndef ADSR
 #define ADSR
@@ -137,8 +145,16 @@ public:
 #endif
         _attack = attack_ticks;
 
-        // Precompute fixed-point scale for fast time->index mapping (Q24 format)
-        // idx ~= delta_ticks * ((ARRAY_SIZE-1) / _attack)
+#if ADSR_BEZIER_USE_FLOAT
+        if (_attack > 0)
+        {
+            _attack_idx_scale = (float)((double)(ARRAY_SIZE - 1) / (double)_attack);
+        }
+        else
+        {
+            _attack_idx_scale = 0.0f;
+        }
+#else
         if (_attack > 0 && _attack <= _time_q24_max_ticks)
         {
             _attack_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_attack;
@@ -147,6 +163,7 @@ public:
         {
             _attack_scale_q24 = 0;
         }
+#endif
     }
 
     // Decay time in milliseconds
@@ -160,6 +177,16 @@ public:
 #endif
         _decay = decay_ticks;
 
+#if ADSR_BEZIER_USE_FLOAT
+        if (_decay > 0)
+        {
+            _decay_idx_scale = (float)((double)(ARRAY_SIZE - 1) / (double)_decay);
+        }
+        else
+        {
+            _decay_idx_scale = 0.0f;
+        }
+#else
         if (_decay > 0 && _decay <= _time_q24_max_ticks)
         {
             _decay_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_decay;
@@ -168,6 +195,7 @@ public:
         {
             _decay_scale_q24 = 0;
         }
+#endif
     }
 
     void setSustain(int l_sustain)
@@ -185,11 +213,19 @@ public:
             range = 0;
         if (_vertical_resolution > 0)
         {
+#if ADSR_BEZIER_USE_FLOAT
+            _decay_range_scale = (float)range / (float)_vertical_resolution;
+#else
             _decay_range_scale_q16 = (int32_t)(((int32_t)range << 16) / _vertical_resolution);
+#endif
         }
         else
         {
+#if ADSR_BEZIER_USE_FLOAT
+            _decay_range_scale = 0.0f;
+#else
             _decay_range_scale_q16 = 0;
+#endif
         }
     }
 
@@ -204,6 +240,16 @@ public:
 #endif
         _release = release_ticks;
 
+#if ADSR_BEZIER_USE_FLOAT
+        if (_release > 0)
+        {
+            _release_idx_scale = (float)((double)(ARRAY_SIZE - 1) / (double)_release);
+        }
+        else
+        {
+            _release_idx_scale = 0.0f;
+        }
+#else
         if (_release > 0 && _release <= _time_q24_max_ticks)
         {
             _release_scale_q24 = (((uint64_t)(ARRAY_SIZE - 1)) << 24) / (uint64_t)_release;
@@ -212,6 +258,7 @@ public:
         {
             _release_scale_q24 = 0;
         }
+#endif
     }
 
     // Use current micros() timestamp internally
@@ -241,11 +288,19 @@ public:
             range = 0;
         if (_vertical_resolution > 0)
         {
+#if ADSR_BEZIER_USE_FLOAT
+            _attack_range_scale = (float)range / (float)_vertical_resolution;
+#else
             _attack_range_scale_q16 = (int32_t)(((int32_t)range << 16) / _vertical_resolution);
+#endif
         }
         else
         {
+#if ADSR_BEZIER_USE_FLOAT
+            _attack_range_scale = 0.0f;
+#else
             _attack_range_scale_q16 = 0;
+#endif
         }
     }
 
@@ -277,11 +332,19 @@ public:
                 rs = _vertical_resolution;
             if (_vertical_resolution > 0)
             {
+#if ADSR_BEZIER_USE_FLOAT
+                _release_range_scale = (float)rs / (float)_vertical_resolution;
+#else
                 _release_range_scale_q16 = (int32_t)((rs << 16) / _vertical_resolution);
+#endif
             }
             else
             {
+#if ADSR_BEZIER_USE_FLOAT
+                _release_range_scale = 0.0f;
+#else
                 _release_range_scale_q16 = 0;
+#endif
             }
         }
     }
@@ -336,24 +399,23 @@ public:
             }
 
             // Time->index mapping for attack
-            uint32_t idx;
-            if (_attack > 0 && _attack <= _time_q24_max_ticks && _attack_scale_q24 != 0)
-            {
-                idx = (uint32_t)(((uint64_t)delta * _attack_scale_q24) >> 24);
-            }
-            else
-            {
-                idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_attack);
-            }
-            if (idx >= ARRAY_SIZE)
-                idx = ARRAY_SIZE - 1;
+#if ADSR_BEZIER_USE_FLOAT
+            uint32_t idx = phaseIndexFloat(delta, _attack, _attack_idx_scale);
+#else
+            uint32_t idx = phaseIndexFixed(delta, _attack, _attack_scale_q24);
+#endif
 
             // Attack curve runs "backwards" through the table
             int curveVal = _curve_tables[_bezier_attack_type][(ARRAY_SIZE - 1) - (int)idx];
 
             // Map to output
+#if ADSR_BEZIER_USE_FLOAT
+            int32_t out = (int32_t)_attack_start +
+                          (int32_t)((float)curveVal * _attack_range_scale);
+#else
             int32_t out = (int32_t)_attack_start +
                           (int32_t)(((int32_t)curveVal * _attack_range_scale_q16) >> 16);
+#endif
             if (out < 0)
                 out = 0;
             if (out > _vertical_resolution)
@@ -382,22 +444,21 @@ public:
                 break;
             }
 
-            uint32_t idx;
-            if (_decay > 0 && _decay <= _time_q24_max_ticks && _decay_scale_q24 != 0)
-            {
-                idx = (uint32_t)(((uint64_t)delta * _decay_scale_q24) >> 24);
-            }
-            else
-            {
-                idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_decay);
-            }
-            if (idx >= ARRAY_SIZE)
-                idx = ARRAY_SIZE - 1;
+#if ADSR_BEZIER_USE_FLOAT
+            uint32_t idx = phaseIndexFloat(delta, _decay, _decay_idx_scale);
+#else
+            uint32_t idx = phaseIndexFixed(delta, _decay, _decay_scale_q24);
+#endif
 
             int curveVal = _curve_tables[_bezier_decay_type][(int)idx];
 
+#if ADSR_BEZIER_USE_FLOAT
+            int32_t out = (int32_t)_sustain +
+                          (int32_t)((float)curveVal * _decay_range_scale);
+#else
             int32_t out = (int32_t)_sustain +
                           (int32_t)(((int32_t)curveVal * _decay_range_scale_q16) >> 16);
+#endif
             if (out < 0)
                 out = 0;
             if (out > _vertical_resolution)
@@ -430,21 +491,19 @@ public:
                 break;
             }
 
-            uint32_t idx;
-            if (_release > 0 && _release <= _time_q24_max_ticks && _release_scale_q24 != 0)
-            {
-                idx = (uint32_t)(((uint64_t)delta * _release_scale_q24) >> 24);
-            }
-            else
-            {
-                idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) / (uint64_t)_release);
-            }
-            if (idx >= ARRAY_SIZE)
-                idx = ARRAY_SIZE - 1;
+#if ADSR_BEZIER_USE_FLOAT
+            uint32_t idx = phaseIndexFloat(delta, _release, _release_idx_scale);
+#else
+            uint32_t idx = phaseIndexFixed(delta, _release, _release_scale_q24);
+#endif
 
             int curveVal = _curve_tables[_bezier_release_type][(int)idx];
 
+#if ADSR_BEZIER_USE_FLOAT
+            int32_t out = (int32_t)((float)curveVal * _release_range_scale);
+#else
             int32_t out = (int32_t)(((int32_t)curveVal * _release_range_scale_q16) >> 16);
+#endif
             if (out < 0)
                 out = 0;
             if (out > _vertical_resolution)
@@ -506,6 +565,54 @@ public:
     }
 
 private:
+#if !ADSR_BEZIER_USE_FLOAT
+    static uint32_t phaseIndexFixed(unsigned long delta,
+                                    unsigned long phase_ticks,
+                                    uint64_t scale_q24)
+    {
+        uint32_t idx;
+        if (phase_ticks > 0 && phase_ticks <= _time_q24_max_ticks && scale_q24 != 0)
+        {
+            idx = (uint32_t)(((uint64_t)delta * scale_q24) >> 24);
+        }
+        else if (phase_ticks > 0)
+        {
+            idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) /
+                             (uint64_t)phase_ticks);
+        }
+        else
+        {
+            idx = 0;
+        }
+        if (idx >= ARRAY_SIZE)
+            idx = ARRAY_SIZE - 1;
+        return idx;
+    }
+#else
+    static uint32_t phaseIndexFloat(unsigned long delta,
+                                    unsigned long phase_ticks,
+                                    float idx_scale)
+    {
+        uint32_t idx;
+        if (phase_ticks > 16777216UL)
+        {
+            idx = (uint32_t)(((uint64_t)(ARRAY_SIZE - 1) * (uint64_t)delta) /
+                             (uint64_t)phase_ticks);
+        }
+        else if (idx_scale > 0.0f)
+        {
+            idx = (uint32_t)floorf((float)delta * idx_scale);
+        }
+        else
+        {
+            idx = 0;
+        }
+        if (idx >= ARRAY_SIZE)
+            idx = ARRAY_SIZE - 1;
+        return idx;
+    }
+#endif
+
     int _bezier_attack_type;
     int _bezier_decay_type;
     int _bezier_release_type;
@@ -517,6 +624,7 @@ private:
     unsigned long _release = 0; // 1ms to 60 sec (in microseconds)
     bool _reset_attack = false; // if _reset_attack is "true" a new trigger starts with 0, if _reset_attack is false it starts with the current output value
 
+#if !ADSR_BEZIER_USE_FLOAT
     // Threshold for using Q24 fixed-point vs exact division (in internal ticks)
 #if ADSR_BEZIER_USE_MICROS
     static constexpr unsigned long _time_q24_max_ticks = 2000000UL; // 2 seconds in µs
@@ -528,6 +636,12 @@ private:
     uint64_t _attack_scale_q24 = 0;
     uint64_t _decay_scale_q24  = 0;
     uint64_t _release_scale_q24 = 0;
+#else
+    // Precomputed float scales for fast time->index conversion
+    float _attack_idx_scale = 0.0f;
+    float _decay_idx_scale = 0.0f;
+    float _release_idx_scale = 0.0f;
+#endif
 
     // Internal ADSR phase state
     enum ADSRPhase
@@ -544,10 +658,16 @@ private:
     // Phase start time (ticks) for the current stage
     unsigned long _t_phase_start = 0;
 
-    // Precomputed fixed-point (Q16) scales for fast curve->output mapping
+    // Precomputed scales for fast curve->output mapping
+#if ADSR_BEZIER_USE_FLOAT
+    float _attack_range_scale = 0.0f;
+    float _decay_range_scale = 0.0f;
+    float _release_range_scale = 0.0f;
+#else
     int32_t _attack_range_scale_q16 = 0;
     int32_t _decay_range_scale_q16 = 0;
     int32_t _release_range_scale_q16 = 0;
+#endif
 
     // time stamp for note on and note off
     unsigned long _t_note_on = 0;
