@@ -4,7 +4,7 @@ ADSR Bezier is a lightweight, digitally‑controlled envelope generator based on
 It is designed to be:
 
 - **Fast at runtime** (fixed-point Q24/Q16 by default, RP2040‑friendly).
-- **Portable** (optional float hot path via `ADSR_BEZIER_USE_FLOAT`).
+- **Portable** (optional optimized integer backend via `ADSR_BEZIER_USE_FLOAT` for RP2350).
 - **Flexible in timing** (supports both `millis()` and `micros()` timebases).
 - **Curve‑shaped** (attack/decay/release follow user‑defined Bézier curves).
 
@@ -21,7 +21,7 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 - **Output**: integer envelope level from `0` to `vertical_resolution` (e.g. `0…4000`).
 - **Time parameters**: `attack`, `decay`, `release` are set in **milliseconds**.
 - **Timebase**: `ADSR_BEZIER_USE_MICROS` (micros vs millis).
-- **Math backend**: `ADSR_BEZIER_USE_FLOAT` (0 = fixed-point default, 1 = float hot path).
+- **Math backend**: `ADSR_BEZIER_USE_FLOAT` (0 = Q24/Q16 fast approximation, 1 = mul+shift index + round-nearest Q16 output).
 - **Curves**:
   - Attack, decay and release each read from a Bézier‑generated lookup table.
   - 8 different curve types are supported (`0…7`), selected separately for A/D/R.
@@ -29,11 +29,11 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 Internally, each call to `getWave()`:
 
 1. Computes the elapsed time since `noteOn()` / `noteOff()` using the chosen timebase.
-2. Converts elapsed time to a **table index** (precomputed scale; fixed Q24 or float `floorf` depending on backend).
-3. Reads the appropriate table value for the current stage (attack/decay/release).
-4. Linearly maps that curve value to the requested output range (Q16 fixed-point or float multiply).
+2. Converts elapsed time to a **table index** (Q24 fast path when `FLOAT=0`; mul+shift reciprocal when `FLOAT=1`).
+3. Reads the appropriate table value for the current stage (attack uses pre-reversed tables).
+4. Linearly maps that curve value to the requested output range (Q16 trunc when `FLOAT=0`; round-nearest Q16 when `FLOAT=1`).
 
-Divisions are precomputed in setters; the hot path has no runtime division.
+Reciprocals and scales are precomputed in setters; the hot path has no runtime integer division.
 
 ---
 
@@ -42,47 +42,106 @@ Divisions are precomputed in setters; the hot path has no runtime division.
 Select at compile time before including the header:
 
 ```cpp
-#define ADSR_BEZIER_USE_FLOAT 0   // default: Q24/Q16 fixed-point (RP2040)
-// #define ADSR_BEZIER_USE_FLOAT 1 // float index + range scales (FPU MCUs)
-#include "ADSR_Bezier.h"
+#define ADSR_BEZIER_USE_FLOAT 0   // default: Q24/Q16 fast approximation (RP2040)
+// #define ADSR_BEZIER_USE_FLOAT 1 // mul+shift index + round-nearest Q16 output (RP2350 / Pico 2)
+#include <ADSR_Bezier.h>
 ```
 
 | Value | Hot path | Best for |
 |-------|----------|----------|
-| `0` (default) | Q24 index + Q16 range | RP2040 / Cortex-M0+ without FPU |
-| `1` | float scale + `floorf` | Teensy 4, ESP32, STM32F4, RP2350 with FPU |
+| `0` (default) | Q24 index + Q16 range | RP2040 / Cortex-M0+ — fastest integer path, ±1 step vs golden |
+| `1` | Mul+shift index reciprocal (all phase lengths); round-nearest Q16 output | RP2350 / Pico 2; ±1 index/output step vs golden |
+
+The optimized backend (`FLOAT=1`) precomputes index division reciprocals and per-phase Q16 output scales in setters/noteOn/noteOff. `getWave()` uses **integer-only** math: index via `(delta × precomputed_mul) >> shift` (uint64 divide only if reciprocal search fails); output via `(curve × range_q16_rn + 32768) >> 16`. No FPU in `getWave()`. Attack reads pre-reversed curve tables (no runtime index inversion).
 
 **Branches:** `main` is canonical (dual backend). `fixed-point-version` and `float-version` are legacy aliases — use `main` with the define above.
 
-Host regression test:
+---
+
+## 1c. Examples and testing
+
+| Layer | Example | What it validates |
+|-------|---------|-------------------|
+| **Host math** | [`examples/compare_fixed_float/`](examples/compare_fixed_float/) | Fixed vs reference index/output formulas (no hardware) |
+| **Device integration** | [`examples/ADSR_benchmark/`](examples/ADSR_benchmark/) | Real `adsr` class, phase state machine, `getWave()` cycle timing |
+| **Basic usage** | [`examples/ADSR_example/`](examples/ADSR_example/) ([README](examples/ADSR_example/README.md)) | Single envelope, DCO-style boot + loop |
+
+**Host regression** (fixed vs reference math):
 
 ```bash
 cd examples/compare_fixed_float
 g++ -std=c++17 -O2 -o compare compare.cpp && ./compare
 ```
 
+**On-device self-test + speed bench** (Pico 2):
+
+```bash
+arduino-cli compile \
+  --fqbn rp2040:rp2040:rpipico2 \
+  --library . \
+  examples/ADSR_benchmark
+```
+
+Open Serial Monitor at **115200** after upload. The benchmark waits until the port is open, then prints PASS/FAIL self-tests and cycles per `getWave()` for attack/decay/sustain/release with **N instances** per iteration (default **1**; set `ADSR_BENCHMARK_INSTANCES` to **3** for DCO EnvDCO + EnvVCA + EnvVCF). At ~10 kHz voice updates with N=3 that is ~30k `getWave()` calls/s — multiply **µs per call** from the benchmark by `10000 × N` to estimate envelope CPU load.
+
+Compare backends: rebuild with `--build-property build.extra_flags=-DADSR_BEZIER_USE_FLOAT=1` or uncomment the define in the sketch. See [`examples/ADSR_benchmark/README.md`](examples/ADSR_benchmark/README.md) for upload and float-toggle details.
+
 ---
 
 ## 2. Installation
 
+The library is **header-only** (`library.properties` lists `includes=ADSR_Bezier.h` only).
+
 ### 2.1. As a generic Arduino library
 
 1. Create a folder in your Arduino libraries directory, e.g. `ADSR_Bezier`.
-2. Copy `ADSR_Bezier.h`, `ADSR_Bezier.cpp` (if present), and this `README.md` into that folder.
-3. In your sketch:
+2. Copy `ADSR_Bezier.h` and `library.properties` into that folder.
+3. In your sketch, define `ARRAY_SIZE` **before** the include, then:
 
 ```cpp
-#include "ADSR_Bezier.h"
+#define ARRAY_SIZE 512
+#include <ADSR_Bezier.h>
 ```
 
-### 2.2. Inside this DCO project
+### 2.2. Inside the DCO monorepo
 
-In this project the Bezier ADSR is integrated via `adsr.h`:
+The DCO firmware pulls this repo in via a symlink:
 
-- `adsr.h` includes `src/ADSR_Bezier/ADSR_Bezier.h`.
-- The DCO project uses a global table generator (`adsrCreateTables`) to fill the Bézier lookup tables at startup.
+- `DCO/_build_libs/ADSR_Bezier` → `../../ADSR_Bezier`
+- [`DCO/adsr.h`](../DCO/adsr.h) sets `ARRAY_SIZE`, optional `ADSR_BEZIER_USE_FLOAT`, and `#include <ADSR_Bezier.h>`
+- Boot calls `init_ADSR()` from the main sketch (table init + setters on all three envelope instances)
 
-You do not need to do anything extra here – just call `init_ADSR()` from your main sketch as shown below.
+You do not need a separate `.cpp` or `adsrCreateTables` — call `adsrBezierInitTables()` once at startup (see §5.2).
+
+### 2.3. Quick start (standalone sketch)
+
+Minimal pattern (see [`examples/ADSR_example/`](examples/ADSR_example/)):
+
+```cpp
+#define ARRAY_SIZE 512
+#ifndef ADSR_BEZIER_USE_FLOAT
+#define ADSR_BEZIER_USE_FLOAT 0
+#endif
+#include <ADSR_Bezier.h>
+
+static adsr env(4095, 0.9995f, 0.9995f, false, 1, 2, 1);
+
+void setup() {
+  adsrBezierInitTables(4000, ARRAY_SIZE, _curve_tables);
+  env.setAttack(100);
+  env.setDecay(200);
+  env.setSustain(2000);   // 0 .. vertical_resolution
+  env.setRelease(300);
+  env.setResetAttack(true);
+}
+
+void loop() {
+  env.noteOn();            // trigger as needed
+  int level = env.getWave();
+}
+```
+
+Table `maxVal` (4000 in DCO) can differ from instance `vertical_resolution` (4095 for EnvVCA/EnvVCF).
 
 ---
 
@@ -121,13 +180,11 @@ public:
 
 ### 3.1. Constructor
 
-- **`vertical_resolution`**: maximum envelope value (e.g. `4000` for a DAC or fixed‑point control range).
-- **`attack_alpha`, `attack_decay_release`**: legacy parameters for the original exponential curve tables (not used when you provide your own Bézier tables; can be left as defaults).
-- **`bezier`**:
-  - `true`: use Bézier tables.
-  - `false`: use the original exponential tables (if compiled in).
+- **`vertical_resolution`**: maximum envelope value (e.g. `4000` for EnvDCO, `4095` for EnvVCA/EnvVCF in DCO).
+- **`attack_alpha`, `attack_decay_release`**: legacy exponential-curve parameters; unused after `adsrBezierInitTables()` — DCO passes nominal values like `0.9995f`.
+- **`bezier`**: legacy flag. Both paths use the shared global `_curve_tables` filled by `adsrBezierInitTables()`. DCO uses `false`.
 - **Curve types** (`bezier_attack_type`, `bezier_decay_type`, `bezier_release_type`):  
-  Index into `_curve_tables[8]` (0–7), letting you choose separate curves for A, D, and R.
+  Indices into `_curve_tables[8]` (0–7). The constructor assigns internal `_bezier_*_type` fields from these args. Change curves at runtime with `adsrCurveAttack()`, `adsrCurveDecay()`, and `adsrCurveRelease()` (as in DCO curve helpers).
 
 ### 3.2. Time parameters (milliseconds)
 
@@ -187,8 +244,9 @@ Timebase is selected at compile time with `ADSR_BEZIER_USE_MICROS`:
 - **Micros mode (default)**:
 
 ```cpp
+#define ARRAY_SIZE 512
 #define ADSR_BEZIER_USE_MICROS 1
-#include "src/ADSR_Bezier/ADSR_Bezier.h"
+#include <ADSR_Bezier.h>
 ```
 
   - Internally uses `micros()` for timing.
@@ -198,8 +256,9 @@ Timebase is selected at compile time with `ADSR_BEZIER_USE_MICROS`:
 - **Millis mode (backwards‑compatible)**:
 
 ```cpp
+#define ARRAY_SIZE 512
 #define ADSR_BEZIER_USE_MICROS 0
-#include "src/ADSR_Bezier/ADSR_Bezier.h"
+#include <ADSR_Bezier.h>
 ```
 
   - Internally uses `millis()` for timing.
@@ -211,53 +270,66 @@ The rest of your code (parameter units, `noteOn()`, `getWave()`) does not change
 
 ## 5. Example: DCO synth ADSR integration (RP2040)
 
-This section shows how the library is used in the DCO synth project in this repo.
+This section mirrors the live DCO firmware ([`DCO/adsr.h`](../DCO/adsr.h), [`DCO/adsr.ino`](../DCO/adsr.ino)).
 
 ### 5.1. Global ADSR configuration (`adsr.h`)
 
-Key parts of `adsr.h` (simplified):
+Each voice carries **three** envelope instances: EnvDCO (pitch/PW), EnvVCA, EnvVCF. Static prototypes are copied into `ADSRStruct`:
 
 ```cpp
-#define ADSR_1_DACSIZE 4000
 #define ARRAY_SIZE 512
+#ifndef ADSR_BEZIER_USE_FLOAT
+#define ADSR_BEZIER_USE_FLOAT 0
+#endif
+#include <ADSR_Bezier.h>
 
-// ADSR Bezier library (provides global curve tables and ADSR class)
-#include "src/ADSR_Bezier/ADSR_Bezier.h"
+static constexpr uint16_t ADSR_1_CC = 4000;
+static constexpr uint16_t ADSR_CV_CC = 4095;
 
-// Per-voice ADSR instances
-adsr adsr1_voice_0(ADSR_1_DACSIZE, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
-adsr adsr1_voice_1(ADSR_1_DACSIZE, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
-adsr adsr1_voice_2(ADSR_1_DACSIZE, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
-adsr adsr1_voice_3(ADSR_1_DACSIZE, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
+adsr adsr1_voice_0(ADSR_1_CC, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
+adsr adsr_vca_voice_0(ADSR_CV_CC, ADSR_VCA_curve1, ADSR_VCA_curve2, false, 1, 2, 1);
+adsr adsr_vcf_voice_0(ADSR_CV_CC, ADSR_VCF_curve1, ADSR_VCF_curve2, false, 4, 6, 1);
+
+struct ADSRStruct {
+  adsr adsr1_voice;
+  adsr adsr_vca_voice;
+  adsr adsr_vcf_voice;
+};
+
+ADSRStruct ADSRVoices[] = {
+  { adsr1_voice_0, adsr_vca_voice_0, adsr_vcf_voice_0 },
+};
 ```
 
 Notes:
 
-- The ADSR Bezier library now owns the global Bézier tables and their generation.
-- Each voice has its own `adsr` instance with `vertical_resolution = 4000`.
+- `adsrBezierInitTables` uses **`ADSR_1_CC` (4000)** for table generation; EnvVCA/EnvVCF still output **0..4095**.
+- DCO uses `bezier=false`; curve shapes come from `_curve_tables` after init.
 
 ### 5.2. Initialization (`adsr.ino`)
 
+Boot builds tables and applies setters to all three envs per voice — **no `noteOn()` at boot**:
+
 ```cpp
 void init_ADSR() {
-  // Initialize ADSR Bézier lookup tables in the library
   adsrBezierInitTables(ADSR_1_CC, ARRAY_SIZE, _curve_tables);
 
-  for (int i = 0; i < LIN_TO_EXP_TABLE_SIZE; i++) {
-    linToLogLookup[i] = linearToLogarithmic(i, 10, maxADSRControlValue);
-  }
-
   for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
-    ADSRVoices[i].adsr1_voice.setAttack(ADSR1_attack);    // ms
-    ADSRVoices[i].adsr1_voice.setDecay(ADSR1_decay);      // ms
-    ADSRVoices[i].adsr1_voice.setSustain(ADSR1_sustain);  // 0..4000
-    ADSRVoices[i].adsr1_voice.setRelease(ADSR1_release);  // ms
+    ADSRVoices[i].adsr1_voice.setAttack(ADSR1_attack);
+    ADSRVoices[i].adsr1_voice.setDecay(ADSR1_decay);
+    ADSRVoices[i].adsr1_voice.setSustain(ADSR1_sustain);
+    ADSRVoices[i].adsr1_voice.setRelease(ADSR1_release);
     ADSRVoices[i].adsr1_voice.setResetAttack(ADSRRestart);
+
+    ADSRVoices[i].adsr_vca_voice.setAttack(ADSR_VCA_attack);
+    // ... decay, sustain, release, setResetAttack for VCA and VCF ...
   }
 }
 ```
 
-### 5.3. Per‑voice update loop
+### 5.3. Per‑voice update loop (~10 kHz)
+
+Note edges only — **no setter spam on `noteOn`** (params stay current via `ADSR_set_parameters` / init / curve helpers). Three `getWave()` calls per voice:
 
 ```cpp
 inline void ADSR_update() {
@@ -265,64 +337,41 @@ inline void ADSR_update() {
   for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
     if (noteEnd[i] == 1) {
       ADSRVoices[i].adsr1_voice.noteOff();
+      ADSRVoices[i].adsr_vca_voice.noteOff();
+      ADSRVoices[i].adsr_vcf_voice.noteOff();
       noteEnd[i] = 0;
     } else if (noteStart[i] == 1) {
       ADSRVoices[i].adsr1_voice.noteOff();
-      ADSRVoices[i].adsr1_voice.setAttack(ADSR1_attack);
-      ADSRVoices[i].adsr1_voice.setDecay(ADSR1_decay);
-      ADSRVoices[i].adsr1_voice.setRelease(ADSR1_release);
       ADSRVoices[i].adsr1_voice.noteOn();
+      ADSRVoices[i].adsr_vca_voice.noteOff();
+      ADSRVoices[i].adsr_vca_voice.noteOn();
+      ADSRVoices[i].adsr_vcf_voice.noteOff();
+      ADSRVoices[i].adsr_vcf_voice.noteOn();
       noteStart[i] = 0;
     }
     ADSR1Level[i] = ADSRVoices[i].adsr1_voice.getWave();
+    ADSR_VCA_Level[i] = ADSRVoices[i].adsr_vca_voice.getWave();
+    ADSR_VCF_Level[i] = ADSRVoices[i].adsr_vcf_voice.getWave();
   }
   ADSR_set_parameters();
 }
 ```
 
-Here:
-
-- `noteStart[i]` / `noteEnd[i]` come from the MIDI/voice allocator.
-- Each voice gets its ADSR envelope updated and stored in `ADSR1Level[i]`.
-- `ADSR1Level[i]` is then used inside the DCO voice engine to modulate amplitude and other parameters.
-
 ### 5.4. Parameter updates at low rate
+
+Debounced push for EnvDCO **and** EnvVCA/EnvVCF A/D/S/R when control values change (~200 Hz):
 
 ```cpp
 inline void ADSR_set_parameters() {
   if ((tADSR - tADSR_params) > 5) {
-    static uint16_t last_attack  = 0xFFFF;
-    static uint16_t last_decay   = 0xFFFF;
-    static uint16_t last_sustain = 0xFFFF;
-    static uint16_t last_release = 0xFFFF;
-
-    bool attack_changed  = (ADSR1_attack  != last_attack);
-    bool decay_changed   = (ADSR1_decay   != last_decay);
-    bool sustain_changed = (ADSR1_sustain != last_sustain);
-    bool release_changed = (ADSR1_release != last_release);
-
-    if (attack_changed || decay_changed || sustain_changed || release_changed) {
-      for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
-        if (attack_changed)  ADSRVoices[i].adsr1_voice.setAttack(ADSR1_attack);
-        if (decay_changed)   ADSRVoices[i].adsr1_voice.setDecay(ADSR1_decay);
-        if (sustain_changed) ADSRVoices[i].adsr1_voice.setSustain(ADSR1_sustain);
-        if (release_changed) ADSRVoices[i].adsr1_voice.setRelease(ADSR1_release);
-      }
-      last_attack  = ADSR1_attack;
-      last_decay   = ADSR1_decay;
-      last_sustain = ADSR1_sustain;
-      last_release = ADSR1_release;
-    }
+    // Compare ADSR1_* and ADSR_VCA_* / ADSR_VCF_* against static last_* caches
+    // On change, setAttack/setDecay/setSustain/setRelease on all voices
     tADSR_params = tADSR;
   }
 }
 ```
 
-This ensures parameter changes (e.g. coming over Serial) are:
-
-- Applied to all voices.
-- Debounced to run only when values actually change.
-- Limited to ~200 Hz (every 5 ms) so they don’t add overhead to the main control loop.
+See full implementation in [`DCO/adsr.ino`](../DCO/adsr.ino) (EnvVCA/EnvVCF debounce blocks). Parameter refresh is **not** done on every note edge.
 
 ---
 
@@ -360,7 +409,7 @@ For each call to `getWave()`:
    - Release index uses the current `release` time; changing `release` while in RELEASE morphs the tail, but earlier phases are unaffected.
 3. Convert `delta` to a table index using the active backend:
    - **Fixed (`ADSR_BEZIER_USE_FLOAT=0`):** Q24 fast path or uint64 division fallback.
-   - **Float (`ADSR_BEZIER_USE_FLOAT=1`):** `floor(delta * idx_scale)` with long-phase uint64 fallback.
+   - **Optimized (`ADSR_BEZIER_USE_FLOAT=1`):** mul+shift index reciprocal for all phase lengths (uint64 divide only if reciprocal search fails).
 4. Clamp `idx` to `[0, ARRAY_SIZE-1]`.
 
 ### 6.3. Table → output level
@@ -376,15 +425,16 @@ Per stage (simplified):
 - **Release**:  
   `out = curveVal * release_start / vertical_resolution`
 
-These are implemented with precomputed range scales (Q16 or float) at setter/noteOn/noteOff time.
+These are implemented with precomputed Q16 scales: truncating (fixed) or round-nearest (`FLOAT=1`) at setter/noteOn/noteOff time. Attack uses pre-reversed curve tables.
 
 ---
 
 ## 7. Tips for using the library
 
 - **For RP2040 / M0+:** keep `ADSR_BEZIER_USE_FLOAT` at `0` (default).
-- **For FPU targets:** set `ADSR_BEZIER_USE_FLOAT` to `1` to use the float hot path.
+- **For RP2350 / Pico 2:** set `ADSR_BEZIER_USE_FLOAT` to `1` for mul+shift index + round-nearest Q16 output (±1 step vs golden).
 - **For best quality:** use micros timebase (`ADSR_BEZIER_USE_MICROS=1`).
+- Define **`ARRAY_SIZE`** in your project before `#include <ADSR_Bezier.h>` (512 in DCO).
 - Adjust `ARRAY_SIZE` for resolution vs RAM trade-off.
 - Use `setResetAttack(true)` for percussive lines; `false` for legato.
 
