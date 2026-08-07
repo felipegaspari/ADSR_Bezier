@@ -16,9 +16,22 @@
 #define ADSR_BEZIER_USE_MICROS 1
 #endif
 
-// Math backend: 0 = Q24 fast approximation, 1 = hardware FPU time / fixed-point amp hybrid
+// Math backend: 0 = Q24 fast approximation (default), 1 = hardware FPU time / fixed-point amp hybrid
 #ifndef ADSR_BEZIER_USE_FLOAT
-#define ADSR_BEZIER_USE_FLOAT 1
+#define ADSR_BEZIER_USE_FLOAT 0
+#endif
+
+// 1 = refresh Q15 in getWave (default). 0 = skip for ADSR_update A/B (u12 path only).
+// Ignored when ADSR_BEZIER_NATIVE_Q15=1 (primary output is already Q15).
+#ifndef ADSR_BEZIER_UPDATE_Q15_CACHE
+#define ADSR_BEZIER_UPDATE_Q15_CACHE 1
+#endif
+
+// Amplitude domain:
+// 0 = DAC-primary (ctor vertical_resolution) + optional Q15 cache (default / DCO shipping).
+// 1 = native Q15 amp (peak ADSR_Q15_ONE); getWave returns Q15; setSustain units are Q15.
+#ifndef ADSR_BEZIER_NATIVE_Q15
+#define ADSR_BEZIER_NATIVE_Q15 0
 #endif
 
 // Emit active config once per translation unit (visible in arduino-cli / IDE compile log).
@@ -34,6 +47,13 @@
 #else
 #pragma message("ADSR_Bezier: timebase=millis (ADSR_BEZIER_USE_MICROS=0)")
 #endif
+#if ADSR_BEZIER_NATIVE_Q15
+#pragma message("ADSR_Bezier: amp=native Q15 (ADSR_BEZIER_NATIVE_Q15=1)")
+#elif !ADSR_BEZIER_UPDATE_Q15_CACHE
+#pragma message("ADSR_Bezier: Q15 cache OFF (ADSR_BEZIER_UPDATE_Q15_CACHE=0) — A/B only")
+#else
+#pragma message("ADSR_Bezier: amp=DAC primary + Q15 cache (ADSR_BEZIER_NATIVE_Q15=0)")
+#endif
 #endif
 
 #ifndef ADSR
@@ -43,6 +63,9 @@
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE 1024
 #endif
+
+// Unipolar Q15 full scale (0..ADSR_Q15_ONE ≈ 0..1). Matches mo-lfo MO_LFO_Q15_ONE magnitude.
+static constexpr int16_t ADSR_Q15_ONE = 32767;
 
 // Global curve table pointers (defined later in this header)
 extern int *_curve_tables[8];
@@ -62,16 +85,46 @@ public:
 
     adsr(int l_vertical_resolution, float attack_alpha, float attack_decay_release, bool bezier, int bezier_attack_type, int bezier_decay_type, int bezier_release_type)
     {
-        _vertical_resolution = l_vertical_resolution; // store vertical resolution (DAC_Size)
-        _attack = 100000;                             // take 100ms as initial value for Attack
-        _sustain = l_vertical_resolution / 2;         // take half the DAC_size as initial value for sustain
-        _decay = 100000;                              // take 100ms as initial value for Decay
-        _release = 100000;                            // take 100ms as initial value for Release
+        _dac_export_vr = (l_vertical_resolution > 0) ? l_vertical_resolution : (int)ADSR_Q15_ONE;
+#if ADSR_BEZIER_NATIVE_Q15
+        // Amp peak is Q15; ctor arg kept only for levelDac() export scale.
+        _vertical_resolution = (int)ADSR_Q15_ONE;
+        _sustain = (int)ADSR_Q15_ONE / 2;
+        _to_q15_mul = 0;
+        if (_dac_export_vr > 0)
+            _to_dac_mul =
+              ((uint32_t)_dac_export_vr << 16) / (uint32_t)ADSR_Q15_ONE;
+        else
+            _to_dac_mul = 0;
+#else
+        _vertical_resolution = l_vertical_resolution; // DAC_Size
+        _sustain = l_vertical_resolution / 2;
+        // Q15 cache: (level * mul) >> 16 ≈ level * ADSR_Q15_ONE / vertical_resolution
+        if (_vertical_resolution > 0)
+            _to_q15_mul =
+              ((uint32_t)ADSR_Q15_ONE << 16) / (uint32_t)_vertical_resolution;
+        else
+            _to_q15_mul = 0;
+        _to_dac_mul = 0;
+#endif
+        _attack = 100000;  // take 100ms as initial value for Attack
+        _decay = 100000;   // take 100ms as initial value for Decay
+        _release = 100000; // take 100ms as initial value for Release
 
         _bezier_attack_type = bezier_attack_type;
         _bezier_decay_type = bezier_decay_type;
         _bezier_release_type = bezier_release_type;
+
+        _adsr_output = 0;
+        _adsr_output_q15 = 0;
+        _adsr_output_q15_src = -1;
     }
+
+#if ADSR_BEZIER_NATIVE_Q15
+    void invalidateQ15Cache() {}
+#else
+    void invalidateQ15Cache() { _adsr_output_q15_src = -1; }
+#endif
 
     void adsrCurveAttack(uint8_t curveType)
     {
@@ -139,6 +192,7 @@ public:
 #endif
     }
 
+    // Sustain level: DAC counts 0..vr when NATIVE_Q15=0; Q15 0..ADSR_Q15_ONE when NATIVE_Q15=1.
     void setSustain(int l_sustain)
     {
         if (l_sustain < 0)
@@ -159,6 +213,7 @@ public:
         {
             _decay_range_scale_q16 = 0;
         }
+        invalidateQ15Cache();
     }
 
     // Release time in milliseconds
@@ -214,6 +269,7 @@ public:
         {
             _attack_range_scale_q16 = 0;
         }
+        invalidateQ15Cache();
     }
 
     void noteOff()
@@ -246,18 +302,24 @@ public:
             {
                 _release_range_scale_q16 = 0;
             }
+            invalidateQ15Cache();
         }
     }
 
-    // Compute ADSR value based on current timebase (micros or millis)
+    // Advance using internal timebase (micros or millis).
     int getWave()
     {
-        unsigned long l_ticks;
 #if ADSR_BEZIER_USE_MICROS
-        l_ticks = micros();
+        return getWave(micros());
 #else
-        l_ticks = millis();
+        return getWave(millis());
 #endif
+    }
+
+    // Advance using caller-supplied timestamp (same units as USE_MICROS).
+    // Prefer one shared t for all envelopes in a tick (see DCO ADSR_update).
+    int getWave(unsigned long l_ticks)
+    {
         unsigned long delta = 0;
 
         switch (_phase)
@@ -299,8 +361,9 @@ public:
 #endif
             int curveVal = _curve_attack_tables[_bezier_attack_type][(int)idx];
 
-            // Amplitude maps via bare metal 1-cycle integer operations
-            int32_t out = (int32_t)_attack_start + (int32_t)(((uint64_t)curveVal * _attack_range_scale_q16) >> 16);
+            // Amplitude map (uint32 enough for table×Q16; avoid uint64 on M0+)
+            int32_t out = (int32_t)_attack_start +
+              (int32_t)(((uint32_t)curveVal * _attack_range_scale_q16) >> 16);
 
             if (out < 0) out = 0;
             if (out > _vertical_resolution) out = _vertical_resolution;
@@ -335,7 +398,8 @@ public:
 
             int curveVal = _curve_tables[_bezier_decay_type][(int)idx];
 
-            int32_t out = (int32_t)_sustain + (int32_t)(((uint64_t)curveVal * _decay_range_scale_q16) >> 16);
+            int32_t out = (int32_t)_sustain +
+              (int32_t)(((uint32_t)curveVal * _decay_range_scale_q16) >> 16);
 
             if (out < 0) out = 0;
             if (out > _vertical_resolution) out = _vertical_resolution;
@@ -376,7 +440,8 @@ public:
 
             int curveVal = _curve_tables[_bezier_release_type][(int)idx];
 
-            int32_t out = (int32_t)(((uint64_t)curveVal * _release_range_scale_q16) >> 16);
+            int32_t out =
+              (int32_t)(((uint32_t)curveVal * _release_range_scale_q16) >> 16);
 
             if (out < 0) out = 0;
             if (out > _vertical_resolution) out = _vertical_resolution;
@@ -391,7 +456,54 @@ public:
             break;
         }
         }
+#if ADSR_BEZIER_NATIVE_Q15
+        // Primary output is already Q15 — keep tap in sync (no remap mul).
+        if (_adsr_output < 0)
+            _adsr_output = 0;
+        if (_adsr_output > (int)ADSR_Q15_ONE)
+            _adsr_output = (int)ADSR_Q15_ONE;
+        _adsr_output_q15 = (int16_t)_adsr_output;
+#elif ADSR_BEZIER_UPDATE_Q15_CACHE
+        // Q15 cache: skip mul when DAC level unchanged (sustain/idle).
+        if (_adsr_output != _adsr_output_q15_src) {
+            _adsr_output_q15_src = _adsr_output;
+            uint32_t q = ((uint32_t)_adsr_output * _to_q15_mul) >> 16;
+            if (q > (uint32_t)ADSR_Q15_ONE) q = (uint32_t)ADSR_Q15_ONE;
+            _adsr_output_q15 = (int16_t)q;
+        }
+#endif
         return _adsr_output;
+    }
+
+    // Q15 from last getWave() (0..ADSR_Q15_ONE ≈ 0..1).
+    // NATIVE_Q15=0: cached remap from DAC. NATIVE_Q15=1: same as getWave domain.
+    int16_t levelQ15() const
+    {
+        return _adsr_output_q15;
+    }
+
+    // DAC-domain level: identity when NATIVE_Q15=0; Q15→ctor-vr export when NATIVE_Q15=1.
+    int levelDac() const
+    {
+#if ADSR_BEZIER_NATIVE_Q15
+        return (int)(((uint32_t)_adsr_output * _to_dac_mul) >> 16);
+#else
+        return _adsr_output;
+#endif
+    }
+
+    // Advance envelope and return Q15 level.
+    // Do not call getWave(t) and getWaveQ15(t) in the same tick (double advance).
+    int16_t getWaveQ15()
+    {
+        getWave();
+        return _adsr_output_q15;
+    }
+
+    int16_t getWaveQ15(unsigned long t)
+    {
+        getWave(t);
+        return _adsr_output_q15;
     }
 
 private:
@@ -421,10 +533,12 @@ private:
     int _bezier_decay_type;
     int _bezier_release_type;
 
-    int _vertical_resolution;
+    int _vertical_resolution; // amp peak: DAC vr (NATIVE=0) or ADSR_Q15_ONE (NATIVE=1)
+    int _dac_export_vr;       // ctor DAC size; used by levelDac() when NATIVE=1
+    uint32_t _to_dac_mul = 0; // (dac_export_vr << 16) / ADSR_Q15_ONE when NATIVE=1
     unsigned long _attack = 0;
     unsigned long _decay = 0; 
-    int _sustain = 0;         
+    int _sustain = 0;         // DAC counts (NATIVE=0) or Q15 (NATIVE=1)
     unsigned long _release = 0;
     bool _reset_attack = false;
 
@@ -466,6 +580,10 @@ private:
     unsigned long _t_note_off = 0;
 
     int _adsr_output;
+    int16_t _adsr_output_q15 = 0;
+    int _adsr_output_q15_src = -1;  // last DAC level converted to Q15
+    // (ADSR_Q15_ONE << 16) / vertical_resolution — set in ctor
+    uint32_t _to_q15_mul = 0;
     int _release_start;
     int _attack_start;
     int _notes_pressed = 0;
@@ -564,29 +682,39 @@ inline float adsrBezierFindYForX(const ADSRBezierPoint &A,
 }
 
 // Generate 8 Bézier curves into the provided curve_tables (size [8][numPoints])
-// maxVal: maximum y value (e.g. vertical_resolution)
+// maxVal: maximum y value (e.g. vertical_resolution or ADSR_Q15_ONE)
 // numPoints: number of points per curve (ARRAY_SIZE)
+//
+// P1/P2 literals are authored near 12-bit CV (~4095); scale by maxVal/4096 (2^12)
+// so shapes stay consistent at Q15 peak (NATIVE_Q15) with an exact dyadic factor.
 inline void adsrBezierInitTables(float maxVal, int numPoints, int *curve_tables[8])
 {
     ADSRBezierPoint A = {0.0f, maxVal};
     ADSRBezierPoint B = {maxVal, 0.0f};
 
-    ADSRBezierPoint P1[8] = {
+    // Scale reference = 2^12 (not 4095): exact float reciprocal; ≈ authored frame.
+    static constexpr float kAuthPeak = 4096.0f;
+    const float s = maxVal / kAuthPeak;
+
+    const ADSRBezierPoint P1_auth[8] = {
         {250.0f, 1500.0f}, {840.0f, 1780.0f}, {400.0f, 430.0f},  {2170.0f, 3610.0f},
         {400.0f, 1380.0f}, {1140.0f, 3750.0f}, {200.0f, 2700.0f}, {0.0f, 4095.0f}};
 
-    ADSRBezierPoint P2[8] = {
+    const ADSRBezierPoint P2_auth[8] = {
         {1500.0f, 250.0f}, {1160.0f, 210.0f}, {920.0f, 420.0f},  {3730.0f, 2610.0f},
         {3830.0f, 2890.0f}, {1850.0f, 1080.0f}, {720.0f, 3050.0f}, {4095.0f, 0.0f}};
 
     for (int j = 0; j < 8; ++j)
     {
+        ADSRBezierPoint P1 = {P1_auth[j].x * s, P1_auth[j].y * s};
+        ADSRBezierPoint P2 = {P2_auth[j].x * s, P2_auth[j].y * s};
+
         float multiplier = (float)(maxVal + 1.0f) / (float)(numPoints - 1);
 
         for (int i = 0; i < numPoints; ++i)
         {
             float xTarget = multiplier * (float)i;
-            float yResult = adsrBezierFindYForX(A, P1[j], P2[j], B, xTarget);
+            float yResult = adsrBezierFindYForX(A, P1, P2, B, xTarget);
 
             curve_tables[j][i] = (int)roundf(yResult);
         }

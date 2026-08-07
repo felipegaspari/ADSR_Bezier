@@ -22,6 +22,7 @@ Edit the defines at the top of [`ADSR_benchmark.ino`](ADSR_benchmark.ino) (all m
 ```cpp
 #define ARRAY_SIZE 512
 // #define ADSR_BEZIER_USE_FLOAT 1
+// #define ADSR_BEZIER_NATIVE_Q15 1  // amp domain Q15; also -DADSR_BEZIER_NATIVE_Q15=1
 
 #define ADSR_BENCHMARK_SELFTEST 1
 #define ADSR_BENCHMARK_SPEED 1
@@ -32,6 +33,8 @@ Edit the defines at the top of [`ADSR_benchmark.ino`](ADSR_benchmark.ino) (all m
 #define ADSR_BENCHMARK_WAIT_SERIAL 1
 // #define ADSR_BENCHMARK_QUIET 1
 ```
+
+With `NATIVE_Q15=1`, init tables at `ADSR_Q15_ONE` and pass Q15 sustain levels (see library README §1b2).
 
 Sweep grids (fixed in sketch):
 
