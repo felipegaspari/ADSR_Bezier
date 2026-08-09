@@ -11,6 +11,8 @@ g++ -std=c++17 -O2 -o compare compare.cpp && ./compare
 
 Use `-DARRAY_SIZE=512` to match DCO table size (default).
 
+`ADSR_BEZIER_SRAM_HOT` is **N/A** here (host g++ test, no RP2040 `.time_critical`).
+
 ## Output sections
 
 | Section | What it measures |

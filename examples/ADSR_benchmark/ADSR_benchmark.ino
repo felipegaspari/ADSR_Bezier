@@ -6,6 +6,7 @@
 #ifndef ADSR_BEZIER_USE_FLOAT
 #define ADSR_BEZIER_USE_FLOAT 1        // same as DCO/adsr.h; set to 1 to compare float backend
 #endif
+// #define ADSR_BEZIER_SRAM_HOT 1       // RP2040: pin getWave/noteOn/noteOff (library default 0)
 // Do not override ADSR_BEZIER_USE_MICROS — library default 1 matches DCO production path
 
 #ifndef ADSR_BENCHMARK_SELFTEST

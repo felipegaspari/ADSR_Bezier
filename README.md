@@ -3,7 +3,7 @@
 ADSR Bezier is a lightweight, digitally‑controlled envelope generator based on precomputed Bézier lookup tables.  
 It is designed to be:
 
-- **Fast at runtime** (fixed-point Q24/Q16 by default, RP2040‑friendly).
+- **Fast at runtime** (fixed-point Q22 time + Q16 amp by default, RP2040‑friendly).
 - **Portable** (optional optimized integer backend via `ADSR_BEZIER_USE_FLOAT` for RP2350).
 - **Flexible in timing** (supports both `millis()` and `micros()` timebases).
 - **Curve‑shaped** (attack/decay/release follow user‑defined Bézier curves).
@@ -21,7 +21,7 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 - **Output**: integer envelope level from `0` to `vertical_resolution` (e.g. `0…4000`), plus optional **Q15 tap**.
 - **Time parameters**: `attack`, `decay`, `release` are set in **milliseconds**.
 - **Timebase**: `ADSR_BEZIER_USE_MICROS` (micros vs millis).
-- **Math backend**: `ADSR_BEZIER_USE_FLOAT` (0 = Q24/Q16 fixed; 1 = native **float** time index + Q16 amp).
+- **Math backend**: `ADSR_BEZIER_USE_FLOAT` (0 = Q22/Q16 fixed; 1 = native **float** time index + Q16 amp).
 - **Curves**:
   - Attack, decay and release each read from a Bézier‑generated lookup table.
   - 8 different curve types are supported (`0…7`), selected separately for A/D/R.
@@ -29,7 +29,7 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 Internally, each call to `getWave()` / `getWave(t)`:
 
 1. Uses elapsed time since phase start (`t` from caller, or `micros()`/`millis()`).
-2. Converts elapsed time to a **table index** (Q24 when `FLOAT=0`; `(float)delta * rate` when `FLOAT=1`).
+2. Converts elapsed time to a **table index** (Q22 `(delta*scale)>>22` when `FLOAT=0`; `(float)delta * rate` when `FLOAT=1`).
 3. Reads the appropriate table value for the current stage (attack uses pre-reversed tables).
 4. Maps that curve value with Q16 amp scaling.
 5. Optionally refreshes a unipolar Q15 cache (`ADSR_BEZIER_UPDATE_Q15_CACHE`).
@@ -43,14 +43,14 @@ Scales are precomputed in setters; the fixed hot path has no runtime integer div
 Select at compile time before including the header:
 
 ```cpp
-#define ADSR_BEZIER_USE_FLOAT 0   // default: Q24/Q16 (RP2040)
+#define ADSR_BEZIER_USE_FLOAT 0   // default: Q22/Q16 (RP2040)
 // #define ADSR_BEZIER_USE_FLOAT 1 // float time index (needs FPU; e.g. RP2350)
 #include <ADSR_Bezier.h>
 ```
 
 | Value | Hot path | Best for |
 |-------|----------|----------|
-| `0` (default) | Q24 index + Q16 range | RP2040 / Cortex-M0+ |
+| `0` (default) | Q22 index + Q16 range | RP2040 / Cortex-M0+ |
 | `1` | `(float)delta * rate_f` index + Q16 amp | RP2350 / Pico 2 (hardware FPU) |
 
 **Branches:** `main` is canonical (dual backend). `fixed-point-version` and `float-version` are legacy aliases — use `main` with the define above.
@@ -65,34 +65,53 @@ Unipolar Q15 uses `ADSR_Q15_ONE` (32767 ≈ 1.0), aligned with mo-lfo’s bipola
 
 | Flag | Default | `getWave` domain | Q15 | `setSustain` units |
 |------|---------|------------------|-----|--------------------|
-| `0` | **yes** (DCO shipping) | DAC counts `0…vertical_resolution` | Secondary cache (`_to_q15_mul`) | DAC counts |
-| `1` | no | Native Q15 `0…ADSR_Q15_ONE` | Primary (no remap mul) | Q15 |
+| `0` | **yes** (library) | DAC counts `0…vertical_resolution` | Secondary cache (`_to_q15_mul`) | DAC counts |
+| `1` | DCO shipping | Internal peak `ADSR_Q15_PEAK`; return/tap `0…ADSR_Q15_ONE` | Primary (no remap mul) | `0…ADSR_Q15_PEAK` |
 
 ```cpp
 #define ADSR_BEZIER_NATIVE_Q15 0   // default: DAC primary + Q15 cache
 // #define ADSR_BEZIER_NATIVE_Q15 1 // native Q15 amp; A/B: -DADSR_BEZIER_NATIVE_Q15=1
+// #define ADSR_BEZIER_Q15_DYADIC 1 // NATIVE=1: peak 32768 (default); 0 = peak 32767
 ```
 
 When `NATIVE_Q15=1`:
 
-- Ctor DAC-size arg is kept as the **`levelDac()`** export scale; amp peak is forced to `ADSR_Q15_ONE`.
-- Init curve tables at the same peak: `adsrBezierInitTables(ADSR_Q15_ONE, …)`. Control points are authored near 4095 and **scaled by `maxVal/4096`** (`2^12`) inside `adsrBezierInitTables` so shapes stay correct at Q15 peak.
-- `levelDac()` exports Q15→ctor-vr (mul+shift).
+- Ctor DAC-size arg is kept as the **`levelDac()`** export scale; amp peak is **`ADSR_Q15_PEAK`** (`32768` if `ADSR_BEZIER_Q15_DYADIC=1`, else `32767`).
+- `getWave` sustain/idle fast-path; A/D/R publishes lean Q15 tap (`0…ADSR_Q15_ONE`).
+- Init curve tables at the same peak: `adsrBezierInitTables(ADSR_Q15_PEAK, …)`. Control points are authored near 4095 and **scaled by `maxVal/4096`** (`2^12`) inside `adsrBezierInitTables` so shapes stay correct at Q15 peak.
+- `levelDac()` exports internal level→ctor-vr (mul+shift).
 - `ADSR_BEZIER_UPDATE_Q15_CACHE` is ignored (no DAC→Q15 remap).
 
-**DCO** ships `ADSR_BEZIER_NATIVE_Q15=1` in [`DCO/adsr.h`](../DCO/adsr.h) (panel sustain converted at `setSustain`; tables init at `ADSR_Q15_ONE` with scaled control points). Library default remains `0` for standalone sketches.
+**DCO** ships `ADSR_BEZIER_NATIVE_Q15=1` + `ADSR_BEZIER_Q15_DYADIC=1` + `ADSR_BEZIER_SRAM_HOT=1` in [`DCO/adsr.h`](../DCO/adsr.h) (panel sustain → peak; tables at `ADSR_Q15_PEAK`; per-call `micros()` including EnvVCF2; RP2040 SRAM pin on `getWave` / `noteOn` / `noteOff`). Library defaults for `NATIVE_Q15` and `SRAM_HOT` remain `0` for standalone sketches.
+
+### SRAM hot path (`ADSR_BEZIER_SRAM_HOT`)
+
+| Value | Meaning |
+|-------|---------|
+| `0` (library default) | Portable / flash. Examples stay here. |
+| `1` | RP2040: `__not_in_flash_func` on `getWave`, `getWave(t)`, `noteOn`, `noteOff`. No-op if the attribute is missing (AVR). |
+
+Define **before** `#include <ADSR_Bezier.h>`. Curve LUTs stay BSS RAM either way; `adsrBezierInitTables` is boot-only (not pinned).
+
+```cpp
+// #define ADSR_BEZIER_SRAM_HOT 1   // RP2040 A/B; library default is 0
+#include <ADSR_Bezier.h>
+```
 
 ### Q15 API (both modes)
 
 | API / flag | Role |
 |------------|------|
-| `ADSR_Q15_ONE` | 32767 — clamp / peak |
+| `ADSR_Q15_ONE` | 32767 — mod-bus / tap full scale |
+| `ADSR_Q15_PEAK` | Internal/table peak (`32768` dyadic or `32767`) |
 | `levelQ15()` | Read Q15 from last `getWave` / `getWave(t)` |
 | `levelDac()` | DAC counts: identity when `NATIVE=0`; Q15→ctor-vr when `NATIVE=1` |
 | `getWaveQ15()` / `getWaveQ15(t)` | Advance once, return Q15 (do **not** also call `getWave` same tick) |
-| `getWave(t)` | Caller-supplied timestamp (share one `t` across envelopes) |
+| `getWave(t)` | Caller-supplied timestamp (optional; DCO uses parameterless `getWave()`) |
 | `invalidateQ15Cache()` | Mode 0: invalidate remap cache; mode 1: no-op |
 | `ADSR_BEZIER_UPDATE_Q15_CACHE` | Mode 0 only: `1` shipping; `0` = A/B skip remap |
+| `ADSR_BEZIER_Q15_DYADIC` | Mode 1 only: `1` = peak 32768 / `<<1` scales; `0` = A/B peak 32767 |
+| `ADSR_BEZIER_SRAM_HOT` | `0` library default; `1` = RP2040 pin `getWave` / `noteOn` / `noteOff` |
 
 Skip-unchanged (mode 0): Q15 mul runs only when the DAC level changes (sustain/idle usually free after first sample).
 
@@ -148,7 +167,7 @@ The library is **header-only** (`library.properties` lists `includes=ADSR_Bezier
 The DCO firmware pulls this repo in via a symlink:
 
 - `DCO/_build_libs/ADSR_Bezier` → `../../ADSR_Bezier`
-- [`DCO/adsr.h`](../DCO/adsr.h) sets `ARRAY_SIZE`, `ADSR_BEZIER_USE_FLOAT`, **`ADSR_BEZIER_NATIVE_Q15=1`**, and `#include <ADSR_Bezier.h>`
+- [`DCO/adsr.h`](../DCO/adsr.h) sets `ARRAY_SIZE`, `ADSR_BEZIER_USE_FLOAT`, **`ADSR_BEZIER_NATIVE_Q15=1`**, **`ADSR_BEZIER_SRAM_HOT=1`**, and `#include <ADSR_Bezier.h>`
 - DCO: native Q15 amp; `adsrBezierInitTables(ADSR_Q15_ONE, …)` (P1/P2 × `maxVal/4096`); consumers read `*_Level_q15`
 - Boot calls `init_ADSR()` from the main sketch (table init + setters on all three envelope instances)
 
@@ -216,7 +235,7 @@ public:
     void noteOff();   // uses millis()/micros() internally
 
     int getWave();                 // advance (internal timebase)
-    int getWave(unsigned long t);  // advance (shared timestamp)
+    int getWave(unsigned long t);  // advance (caller timestamp; prefer getWave())
     int16_t levelQ15();            // Q15 after last advance
     int levelDac();                // DAC counts (export when NATIVE_Q15=1)
 };
@@ -273,12 +292,12 @@ When `ADSR_BEZIER_USE_MICROS == 0`:
 
 ### 3.6. Reading the envelope
 
-- **`int getWave()`**: Advances using an internal `micros()` / `millis()` read. Returns DAC counts when `NATIVE_Q15=0`, or Q15 when `NATIVE_Q15=1`.
-- **`int getWave(unsigned long t)`**: Same advance with a **caller-supplied** timestamp (share one `t` across envelopes in a tick).
-- **`int16_t levelQ15()`**: Unipolar Q15 from the last advance (`0…ADSR_Q15_ONE`). Prefer this after `getWave(t)` instead of calling `getWaveQ15` in the same tick.
+- **`int getWave()`**: Advances using an internal `micros()` / `millis()` read. Returns DAC counts when `NATIVE_Q15=0`, or Q15 when `NATIVE_Q15=1`. Prefer this when `noteOn`/`noteOff` also use the internal timebase (DCO shipping).
+- **`int getWave(unsigned long t)`**: Same advance with a **caller-supplied** timestamp. If you use this after `noteOn()`/`noteOff()`, `t` must not be earlier than the edge stamp — unsigned `delta` underflow skips attack/release. Prefer `getWave()` instead.
+- **`int16_t levelQ15()`**: Unipolar Q15 from the last advance (`0…ADSR_Q15_ONE`). Prefer this after `getWave` / `getWave(t)` instead of calling `getWaveQ15` in the same tick.
 - **`int levelDac()`**: DAC-domain level (identity when `NATIVE_Q15=0`; Q15→ctor-vr export when `NATIVE_Q15=1`).
 
-At a fixed control rate (e.g. ~100 µs on RP2040), take one shared `t`, call `getWave(t)` per envelope, then read `levelQ15()` for mod taps.
+At a fixed control rate (e.g. ~100 µs on RP2040), call `getWave()` per envelope (each reads time internally), then read `levelQ15()` for mod taps.
 
 ---
 
@@ -374,26 +393,20 @@ void init_ADSR() {
 
 ### 5.3. Per‑voice update loop (~10 kHz)
 
-Note edges only — **no setter spam on `noteOn`** (params stay current via `ADSR_set_parameters` / init / curve helpers). One shared timestamp; EnvVCF/EnvVCF2 sampled once per tick (not inside the voice loop):
+Note edges only — **no setter spam on `noteOn`** (params stay current via `ADSR_set_parameters` / init / curve helpers). Each call uses its own timebase; EnvVCF/EnvVCF2 sampled once per tick (not inside the voice loop):
 
 ```cpp
 inline void ADSR_update() {
-#if ADSR_BEZIER_USE_MICROS
-  const unsigned long t = micros();
-#else
-  const unsigned long t = millis();
-#endif
-
   for (int i = 0; i < NUM_VOICES; i++) {
     // noteStart[] / noteEnd[] → noteOn/noteOff on EnvDCO, EnvVCA, EnvVCF, EnvVCF2
-    ADSR1Level[i] = ADSRVoices[i].adsr1_voice.getWave(t);
+    ADSR1Level[i] = ADSRVoices[i].adsr1_voice.getWave();
     ADSR1Level_q15[i] = ADSRVoices[i].adsr1_voice.levelQ15();
-    ADSR_VCA_Level[i] = ADSRVoices[i].adsr_vca_voice.getWave(t);
+    ADSR_VCA_Level[i] = ADSRVoices[i].adsr_vca_voice.getWave();
     ADSR_VCA_Level_q15[i] = ADSRVoices[i].adsr_vca_voice.levelQ15();
   }
-  ADSR_VCF_Level = adsr_vcf_voice.getWave(t);
+  ADSR_VCF_Level = adsr_vcf_voice.getWave();
   ADSR_VCF_Level_q15 = adsr_vcf_voice.levelQ15();
-  ADSR_VCF2_Level = adsr_vcf2_voice.getWave(t);
+  ADSR_VCF2_Level = adsr_vcf2_voice.getWave();
   ADSR_VCF2_Level_q15 = adsr_vcf2_voice.levelQ15();
 
   ADSR_set_parameters();
@@ -439,7 +452,7 @@ For each call to `getWave()` / `getWave(t)`:
    - Decay index uses the current `decay` time; changing `decay` while in DECAY morphs the remaining decay, but does not affect RELEASE.
    - Release index uses the current `release` time; changing `release` while in RELEASE morphs the tail, but earlier phases are unaffected.
 3. Convert `delta` to a table index using the active backend:
-   - **Fixed (`ADSR_BEZIER_USE_FLOAT=0`):** Q24 fast path or uint64 division fallback.
+   - **Fixed (`ADSR_BEZIER_USE_FLOAT=0`):** Q22 `(delta*scale)>>22` or uint64 division fallback when scale is 0.
    - **Float index (`ADSR_BEZIER_USE_FLOAT=1`):** `(float)delta * rate_f` (needs hardware FPU; e.g. RP2350).
 4. Clamp `idx` to `[0, ARRAY_SIZE-1]`.
 
@@ -464,7 +477,7 @@ Both backends map curve → level with precomputed **Q16** amplitude scales (set
 
 - **For RP2040 / M0+:** keep `ADSR_BEZIER_USE_FLOAT` at `0` (default) — soft-float makes `FLOAT=1` slower.
 - **For RP2350 / Pico 2:** `ADSR_BEZIER_USE_FLOAT=1` can win via hardware FPU on the time index; A/B with the profiler before shipping.
-- Share one `getWave(t)` timestamp across all envelopes in a tick (see §5.3).
+- Prefer parameterless `getWave()` when `noteOn`/`noteOff` also use the internal timebase (see §5.3). Do not pass a shared `t` taken before note edges — unsigned delta underflow skips attack/release.
 - **For best quality:** use micros timebase (`ADSR_BEZIER_USE_MICROS=1`).
 - Define **`ARRAY_SIZE`** in your project before `#include <ADSR_Bezier.h>` (512 in DCO).
 - Adjust `ARRAY_SIZE` for resolution vs RAM trade-off.

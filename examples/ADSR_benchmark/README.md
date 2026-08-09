@@ -23,6 +23,7 @@ Edit the defines at the top of [`ADSR_benchmark.ino`](ADSR_benchmark.ino) (all m
 #define ARRAY_SIZE 512
 // #define ADSR_BEZIER_USE_FLOAT 1
 // #define ADSR_BEZIER_NATIVE_Q15 1  // amp domain Q15; also -DADSR_BEZIER_NATIVE_Q15=1
+// #define ADSR_BEZIER_SRAM_HOT 1    // RP2040 SRAM pin; also -DADSR_BEZIER_SRAM_HOT=1
 
 #define ADSR_BENCHMARK_SELFTEST 1
 #define ADSR_BENCHMARK_SPEED 1
@@ -96,3 +97,13 @@ arduino-cli compile --fqbn rp2040:rp2040:rpipico2 --library . \
 ```
 
 Host math checks: [`../compare_fixed_float/`](../compare_fixed_float/).
+
+## Compare SRAM pin (`ADSR_BEZIER_SRAM_HOT=1`)
+
+Library default is **0**. On Pico, pin `getWave` / `noteOn` / `noteOff` for a speed A/B vs flash:
+
+```bash
+arduino-cli compile --fqbn rp2040:rp2040:rpipico2 --library . \
+  --build-property build.extra_flags=-DADSR_BEZIER_SRAM_HOT=1 \
+  examples/ADSR_benchmark
+```
