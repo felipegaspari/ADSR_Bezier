@@ -25,6 +25,14 @@ For a conceptual introduction to ADSR and this style of lookup‑based envelopes
 - **Curves**:
   - Attack, decay and release each read from a Bézier‑generated lookup table.
   - 8 different curve types are supported (`0…7`), selected separately for A/D/R.
+                  "0 - EXP ": 0,
+                  "1 - SOFT ": 1,
+                  "2 - STEEP ": 2,
+                  "3 - CONCAVE ": 3,
+                  "4 - FAST S ": 4,
+                  "5 - SLOW THEN LIN ": 5,
+                  "6 - ALMOST LIN ": 6,
+                  "7 - LINEAR ": 7
 
 Internally, each call to `getWave()` / `getWave(t)`:
 
