@@ -16,19 +16,43 @@
 // COMPILE-TIME CONFIGURATION & MATH BACKENDS
 // =================================================================
 
-// Select timebase:
-// 1 -> use micros() internally (high resolution)
-// 0 -> use millis() internally (backwards-compatible behavior)
+/**
+ * @def ADSR_BEZIER_USE_MICROS
+ * @brief Select internal timing resolution:
+ *        1 -> use micros() internally (high resolution microsecond timebase)
+ *        0 -> use millis() internally (backwards-compatible millisecond timebase)
+ */
 #ifndef ADSR_BEZIER_USE_MICROS
 #define ADSR_BEZIER_USE_MICROS 1
 #endif
 
-// Math backend: 0 = fixed phase index + Q16 amp (default), 1 = hardware FPU time / fixed-point amp hybrid
-// ADSR_BEZIER_PHASE_SHIFT: 22 = uint32 mul (fast); 24 = uint64 mul (smoother long A/D/R, A/B).
+/**
+ * @def ADSR_BEZIER_RESET_TRANSITION_US
+ * @brief Default anti-click slew transition duration in microseconds when restarting
+ *        an envelope from a non-zero level with resetAttack enabled.
+ *        - Set to 0 to disable (hard immediate jump to 0).
+ *        - Default is 2000 us (2.0 ms) which eliminates DC clicks without perceptible latency.
+ */
+#ifndef ADSR_BEZIER_RESET_TRANSITION_US
+#define ADSR_BEZIER_RESET_TRANSITION_US 1000UL
+#endif
+
+/**
+ * @def ADSR_BEZIER_USE_FLOAT
+ * @brief Math backend selector:
+ *        0 -> Fixed-point phase index + Q16 amplitude scaling (fastest on integer MCUs / Cortex-M0+).
+ *        1 -> Hardware FPU time rate / fixed-point amplitude hybrid (optimized for Cortex-M4F/M7/RP2350).
+ */
 #ifndef ADSR_BEZIER_USE_FLOAT
 #define ADSR_BEZIER_USE_FLOAT 0
 #endif
 
+/**
+ * @def ADSR_BEZIER_PHASE_SHIFT
+ * @brief Fixed-point phase accumulator bitshift.
+ *        - 22: uint32 multiplication (fast 32-bit arithmetic hot path).
+ *        - 24: uint64 multiplication (ultra-smooth interpolation for long A/D/R times).
+ */
 #ifndef ADSR_BEZIER_PHASE_SHIFT
 #define ADSR_BEZIER_PHASE_SHIFT 22
 #endif
@@ -39,31 +63,48 @@
 #define ADSR_BEZIER_PHASE_SCALE_U64 0
 #endif
 
-// 1 = refresh Q15 in getWave (default). 0 = skip for ADSR_update A/B (u12 path only).
-// Ignored when ADSR_BEZIER_NATIVE_Q15=1 (primary output is already Q15).
+/**
+ * @def ADSR_BEZIER_UPDATE_Q15_CACHE
+ * @brief Controls whether the cached Q15 output is updated on every getWave() call.
+ *        1 -> refresh Q15 in getWave (default).
+ *        0 -> skip for ADSR_update A/B (u12 path only).
+ *        Ignored when ADSR_BEZIER_NATIVE_Q15=1 (primary output is already native Q15).
+ */
 #ifndef ADSR_BEZIER_UPDATE_Q15_CACHE
 #define ADSR_BEZIER_UPDATE_Q15_CACHE 1
 #endif
 
-// Amplitude domain:
-// 0 = DAC-primary (ctor vertical_resolution) + optional Q15 cache (default / DCO shipping).
-// 1 = native Q15 amp (peak ADSR_Q15_PEAK); getWave returns Q15 tap 0..ADSR_Q15_ONE; setSustain units are peak.
+/**
+ * @def ADSR_BEZIER_NATIVE_Q15
+ * @brief Amplitude domain selector:
+ *        0 -> DAC-primary (constructor vertical_resolution) + optional Q15 cache (default / DCO shipping).
+ *        1 -> Native Q15 amplitude (peak ADSR_Q15_PEAK); getWave returns Q15 tap 0..ADSR_Q15_ONE;
+ *             setSustain units are in Q15 peak units.
+ */
 #ifndef ADSR_BEZIER_NATIVE_Q15
 #define ADSR_BEZIER_NATIVE_Q15 0
 #endif
 
-// NATIVE=1 only: amp peak 32768 (dyadic >>15-friendly scales). Tap/bus full scale stays 32767.
-// Set 0 to A/B peak=32767 (non-dyadic divides in setters).
+/**
+ * @def ADSR_BEZIER_Q15_DYADIC
+ * @brief When NATIVE_Q15=1, sets peak amplitude to 32768 (1<<15) to enable dyadic >>15 bitshifts
+ *        and eliminate runtime divisions. Output tap remains clamped to 32767.
+ *        Set to 0 to force non-dyadic 32767 peak.
+ */
 #ifndef ADSR_BEZIER_Q15_DYADIC
 #define ADSR_BEZIER_Q15_DYADIC 1
 #endif
 
+// =============================================================================
+// SRAM HOT PATH PLACEMENT (RP2040 / RP2350 / ARM Cortex-M)
+// =============================================================================
 // 1 = RP2040 __not_in_flash_func on getWave / noteOn / noteOff (define before include).
 // 0 = portable / flash (library default). No-op if the attribute is missing (AVR).
 // Curve tables stay BSS RAM either way; adsrBezierInitTables is boot-only (not pinned).
 #ifndef ADSR_BEZIER_SRAM_HOT
 #define ADSR_BEZIER_SRAM_HOT 0
 #endif
+
 #if ADSR_BEZIER_SRAM_HOT
 #ifndef __not_in_flash_func
 #define __not_in_flash_func(fn) fn
@@ -73,7 +114,16 @@
 #define ADSR_BEZIER_HOT(fn) fn
 #endif
 
-// Emit active config once per translation unit (visible in arduino-cli / IDE compile log).
+// Always-inline attribute to guarantee zero Flash branching in hot loops
+#ifndef ADSR_ALWAYS_INLINE
+#if defined(__GNUC__) || defined(__clang__)
+#define ADSR_ALWAYS_INLINE __attribute__((always_inline)) inline
+#else
+#define ADSR_ALWAYS_INLINE inline
+#endif
+#endif
+
+// Emit active config once per translation unit (visible in compile logs)
 #ifndef ADSR_BEZIER_CONFIG_REPORTED
 #define ADSR_BEZIER_CONFIG_REPORTED
 #if ADSR_BEZIER_USE_FLOAT
@@ -101,6 +151,11 @@
 #else
 #pragma message("ADSR_Bezier: amp=DAC primary + Q15 cache (ADSR_BEZIER_NATIVE_Q15=0)")
 #endif
+#if ADSR_BEZIER_RESET_TRANSITION_US > 0
+#pragma message("ADSR_Bezier: anti-click reset transition ON")
+#else
+#pragma message("ADSR_Bezier: anti-click reset transition OFF (hard jump)")
+#endif
 #if ADSR_BEZIER_SRAM_HOT
 #pragma message("ADSR_Bezier: SRAM hot path ON (ADSR_BEZIER_SRAM_HOT=1) — getWave/noteOn/noteOff .time_critical")
 #else
@@ -108,7 +163,7 @@
 #endif
 #endif
 
-// for array for lookup table
+// Lookup table point count per curve
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE 1024
 #endif
@@ -198,7 +253,7 @@ inline int _curve_attack_tables[8][ARRAY_SIZE];
 
 /**
  * @class adsr
- * @brief High-performance ADSR envelope generator with Bézier curve profiling.
+ * @brief High-performance ADSR envelope generator with Bézier curve profiling and anti-click slew.
  */
 class adsr
 {
@@ -253,6 +308,13 @@ public:
         _release = 100000; // take 100ms as initial value for Release
         _configured_release = _release;
 
+        // Initialize anti-click reset transition time from compile macro
+#if ADSR_BEZIER_USE_MICROS
+        setResetTransitionUs(ADSR_BEZIER_RESET_TRANSITION_US);
+#else
+        setResetTransitionMs((ADSR_BEZIER_RESET_TRANSITION_US + 999UL) / 1000UL);
+#endif
+
         _bezier_attack_type = attack_curve;
         _bezier_decay_type = decay_curve;
         _bezier_release_type = release_curve;
@@ -264,24 +326,19 @@ public:
     }
 
 #if ADSR_BEZIER_NATIVE_Q15
+    /**
+     * @brief Invalidate cached Q15 output (no-op in native Q15 mode).
+     */
     void invalidateQ15Cache() {}
 #else
+    /**
+     * @brief Invalidate cached Q15 output forcing recalculation on next read.
+     */
     void invalidateQ15Cache() { _adsr_output_q15_src = -1; }
 #endif
 
     /**
      * @brief Set the curve shape preset for the Attack phase.
-     * 
-     * ### Curve Options:
-     * - `0` / **`ADSR_CURVE_EXP_NATURAL`**   : "Natural Exp"
-     * - `1` / **`ADSR_CURVE_EXP_SMOOTH`**    : "Smooth Exp"
-     * - `2` / **`ADSR_CURVE_PERCUSSIVE`**    : "Percussive"
-     * - `3` / **`ADSR_CURVE_LOG_CONVEX`**    : "Log / Convex"
-     * - `4` / **`ADSR_CURVE_S_CURVE_SOFT`**  : "Soft S-Curve"
-     * - `5` / **`ADSR_CURVE_S_CURVE_STEEP`** : "Steep S-Curve"
-     * - `6` / **`ADSR_CURVE_ROUNDED`**       : "Rounded"
-     * - `7` / **`ADSR_CURVE_LINEAR`**        : "Linear"
-     * 
      * @param curve_type Curve index (0 to 7) or ADSRCurveType.
      */
     void adsrCurveAttack(uint8_t curve_type)
@@ -292,17 +349,6 @@ public:
 
     /**
      * @brief Set the curve shape preset for the Decay phase.
-     * 
-     * ### Curve Options:
-     * - `0` / **`ADSR_CURVE_EXP_NATURAL`**   : "Natural Exp"
-     * - `1` / **`ADSR_CURVE_EXP_SMOOTH`**    : "Smooth Exp"
-     * - `2` / **`ADSR_CURVE_PERCUSSIVE`**    : "Percussive"
-     * - `3` / **`ADSR_CURVE_LOG_CONVEX`**    : "Log / Convex"
-     * - `4` / **`ADSR_CURVE_S_CURVE_SOFT`**  : "Soft S-Curve"
-     * - `5` / **`ADSR_CURVE_S_CURVE_STEEP`** : "Steep S-Curve"
-     * - `6` / **`ADSR_CURVE_ROUNDED`**       : "Rounded"
-     * - `7` / **`ADSR_CURVE_LINEAR`**        : "Linear"
-     * 
      * @param curve_type Curve index (0 to 7) or ADSRCurveType.
      */
     void adsrCurveDecay(uint8_t curve_type)
@@ -314,20 +360,9 @@ public:
     /**
      * @brief Set the curve shape preset for the Release phase at runtime.
      *        If called mid-release, seamlessly re-anchors to avoid audio clicks/pops.
-     * 
-     * ### Curve Options:
-     * - `0` / **`ADSR_CURVE_EXP_NATURAL`**   : "Natural Exp" (Classic analog decay)
-     * - `1` / **`ADSR_CURVE_EXP_SMOOTH`**    : "Smooth Exp" (Soft exponential knee)
-     * - `2` / **`ADSR_CURVE_PERCUSSIVE`**    : "Percussive" (Sharp punchy hyperbolic drop)
-     * - `3` / **`ADSR_CURVE_LOG_CONVEX`**    : "Log / Convex" (Holds high before sudden drop)
-     * - `4` / **`ADSR_CURVE_S_CURVE_SOFT`**  : "Soft S-Curve" (Smooth sigmoidal transition)
-     * - `5` / **`ADSR_CURVE_S_CURVE_STEEP`** : "Steep S-Curve" (Aggressive inflection)
-     * - `6` / **`ADSR_CURVE_ROUNDED`**       : "Rounded" (Gentle convex slope)
-     * - `7` / **`ADSR_CURVE_LINEAR`**        : "Linear" (Constant straight ramp)
-     * 
      * @param curve_type Curve index (0 to 7) or ADSRCurveType.
      */
-    void adsrCurveRelease(uint8_t curve_type)
+    void ADSR_BEZIER_HOT(adsrCurveRelease)(uint8_t curve_type)
     {
         if (curve_type >= ADSR_NUM_CURVES) curve_type = ADSR_NUM_CURVES - 1;
         if (_bezier_release_type == curve_type) return;
@@ -335,11 +370,11 @@ public:
         // If switched mid-release, re-anchor from current output over remaining time
         if (_phase == ADSR_PHASE_RELEASE)
         {
-            unsigned long now = 
+            unsigned long now;
 #if ADSR_BEZIER_USE_MICROS
-                micros();
+            now = micros();
 #else
-                millis();
+            now = millis();
 #endif
             unsigned long elapsed = now - _t_phase_start;
             
@@ -371,12 +406,93 @@ public:
         bindCurvePtrs();
     }
 
+    /**
+     * @brief Enable or disable attack phase restart behavior on Note On.
+     * @param l_reset_attack true: reset envelope level toward 0 on retrigger.
+     *                       false: analog legato mode (re-attack begins from current envelope level).
+     */
     void setResetAttack(bool l_reset_attack)
     {
         _reset_attack = l_reset_attack;
     }
 
-    // Attack time in milliseconds
+    /**
+     * @brief Check whether resetAttack mode is currently enabled.
+     * @return bool True if re-attack resets toward 0.
+     */
+    bool getResetAttack() const
+    {
+        return _reset_attack;
+    }
+
+    /**
+     * @brief Set the anti-click slew transition duration in microseconds.
+     *        When resetAttack is true and Note On arrives while output > 0, this duration
+     *        is used to softly ramp down to 0 before launching the Attack phase.
+     * @param l_reset_us Transition duration in microseconds (0 = hard instant jump).
+     */
+    void setResetTransitionUs(unsigned long l_reset_us)
+    {
+#if ADSR_BEZIER_USE_MICROS
+        _reset_transition = l_reset_us;
+#else
+        _reset_transition = (l_reset_us + 999UL) / 1000UL;
+#endif
+#if ADSR_BEZIER_USE_FLOAT
+        _reset_rate_f = (_reset_transition > 0) ? ((float)(ARRAY_SIZE - 1) / (float)_reset_transition) : 0.0f;
+#else
+        _reset_scale_phase = phaseScale(_reset_transition);
+#endif
+    }
+
+    /**
+     * @brief Set the anti-click slew transition duration in milliseconds.
+     * @param l_reset_ms Transition duration in milliseconds (0 = hard instant jump).
+     */
+    void setResetTransitionMs(unsigned long l_reset_ms)
+    {
+#if ADSR_BEZIER_USE_MICROS
+        _reset_transition = l_reset_ms * 1000UL;
+#else
+        _reset_transition = l_reset_ms;
+#endif
+#if ADSR_BEZIER_USE_FLOAT
+        _reset_rate_f = (_reset_transition > 0) ? ((float)(ARRAY_SIZE - 1) / (float)_reset_transition) : 0.0f;
+#else
+        _reset_scale_phase = phaseScale(_reset_transition);
+#endif
+    }
+
+    /**
+     * @brief Get the configured anti-click reset transition duration in microseconds.
+     * @return unsigned long Transition duration in microseconds.
+     */
+    unsigned long getResetTransitionUs() const
+    {
+#if ADSR_BEZIER_USE_MICROS
+        return _reset_transition;
+#else
+        return _reset_transition * 1000UL;
+#endif
+    }
+
+    /**
+     * @brief Get the configured anti-click reset transition duration in milliseconds.
+     * @return unsigned long Transition duration in milliseconds.
+     */
+    unsigned long getResetTransitionMs() const
+    {
+#if ADSR_BEZIER_USE_MICROS
+        return (_reset_transition + 999UL) / 1000UL;
+#else
+        return _reset_transition;
+#endif
+    }
+
+    /**
+     * @brief Set Attack duration in milliseconds.
+     * @param l_attack_ms Attack time in ms.
+     */
     void setAttack(unsigned long l_attack_ms)
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -397,7 +513,10 @@ public:
 #endif
     }
 
-    // Decay time in milliseconds
+    /**
+     * @brief Set Decay duration in milliseconds.
+     * @param l_decay_ms Decay time in ms.
+     */
     void setDecay(unsigned long l_decay_ms)
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -417,7 +536,11 @@ public:
 #endif
     }
 
-    // Sustain level: DAC counts 0..vr when NATIVE_Q15=0; 0..ADSR_Q15_PEAK when NATIVE_Q15=1.
+    /**
+     * @brief Set Sustain level.
+     * @param l_sustain Target sustain level (0..vertical_resolution when NATIVE_Q15=0;
+     *                  0..ADSR_Q15_PEAK when NATIVE_Q15=1).
+     */
     void setSustain(int l_sustain)
     {
         if (l_sustain < 0)
@@ -433,7 +556,10 @@ public:
         invalidateQ15Cache();
     }
 
-    // Release time in milliseconds
+    /**
+     * @brief Set Release duration in milliseconds.
+     * @param l_release_ms Release time in ms.
+     */
     void setRelease(unsigned long l_release_ms)
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -454,7 +580,11 @@ public:
 #endif
     }
 
-    // Use current micros() timestamp internally
+    /**
+     * @brief Trigger Note On event using current internal timestamp.
+     *        If resetAttack is enabled and current level > 0, safely initiates
+     *        a soft ramp-down transition before advancing to the Attack phase.
+     */
     void ADSR_BEZIER_HOT(noteOn)()
     {
         unsigned long now;
@@ -463,24 +593,52 @@ public:
 #else
         now = millis();
 #endif
-        if (_reset_attack)
-            _attack_start = 0;
-        else
-            _attack_start = _adsr_output;
-        // One gate per instance. Retrigger without a leading noteOff (else count
-        // accumulates and a single noteOff never reaches release).
+        // One gate per instance. Retrigger without a leading noteOff.
         _notes_pressed = 1;
 
-        _phase = ADSR_PHASE_ATTACK;
-        _t_phase_start = now;
+        if (_reset_attack)
+        {
+            // If already at zero level or transition disabled (0 ticks), enter Attack immediately
+            if (_adsr_output <= 0 || _reset_transition == 0)
+            {
+                _attack_start = 0;
+                _phase = ADSR_PHASE_ATTACK;
+                _t_phase_start = now;
 
-        int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
-        if (range < 0) range = 0;
+                _attack_range_scale_q16 = rangeScaleQ16((int32_t)_vertical_resolution, _vertical_resolution);
+                invalidateQ15Cache();
+            }
+            else
+            {
+                // Soft ramp down to 0 before launching attack
+                _reset_start_level = _adsr_output;
+                if (_reset_start_level > _vertical_resolution) _reset_start_level = _vertical_resolution;
 
-        _attack_range_scale_q16 = rangeScaleQ16(range, _vertical_resolution);
-        invalidateQ15Cache();
+                _phase = ADSR_PHASE_RESET_TRANSITION;
+                _t_phase_start = now;
+
+                _reset_range_scale_q16 = rangeScaleQ16((int32_t)_reset_start_level, _vertical_resolution);
+                invalidateQ15Cache();
+            }
+        }
+        else
+        {
+            _attack_start = _adsr_output;
+            _phase = ADSR_PHASE_ATTACK;
+            _t_phase_start = now;
+
+            int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
+            if (range < 0) range = 0;
+
+            _attack_range_scale_q16 = rangeScaleQ16(range, _vertical_resolution);
+            invalidateQ15Cache();
+        }
     }
 
+    /**
+     * @brief Trigger Note Off event using current internal timestamp.
+     *        Transitions envelope to the Release phase, capturing the current output anchor.
+     */
     void ADSR_BEZIER_HOT(noteOff)()
     {
         _notes_pressed--;
@@ -508,7 +666,10 @@ public:
         }
     }
 
-    // Advance using internal timebase (micros or millis).
+    /**
+     * @brief Advance envelope and compute current sample using internal timebase.
+     * @return int Output value in native domain (DAC counts or native Q15).
+     */
     int ADSR_BEZIER_HOT(getWave)()
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -518,8 +679,11 @@ public:
 #endif
     }
 
-    // Advance using caller-supplied timestamp (same units as USE_MICROS).
-    // Prefer getWave() when noteOn/noteOff also use the internal timebase.
+    /**
+     * @brief Advance envelope and compute current sample using a caller-supplied timestamp.
+     * @param l_ticks Current timestamp in ticks (micros or millis matching ADSR_BEZIER_USE_MICROS).
+     * @return int Output value in native domain.
+     */
     int ADSR_BEZIER_HOT(getWave)(unsigned long l_ticks)
     {
 #if ADSR_BEZIER_NATIVE_Q15
@@ -539,6 +703,45 @@ public:
 
         switch (_phase)
         {
+        case ADSR_PHASE_RESET_TRANSITION:
+        {
+            delta = l_ticks - _t_phase_start;
+            if (delta >= _reset_transition)
+            {
+                _adsr_output = 0;
+                _attack_start = 0;
+                _t_phase_start = l_ticks;
+                _attack_range_scale_q16 = rangeScaleQ16((int32_t)_vertical_resolution, _vertical_resolution);
+
+                if (_attack == 0)
+                {
+                    _adsr_output = _vertical_resolution;
+                    if (_decay > 0) {
+                        _phase = ADSR_PHASE_DECAY;
+                    } else {
+                        _phase = ADSR_PHASE_SUSTAIN;
+                    }
+                }
+                else
+                {
+                    _phase = ADSR_PHASE_ATTACK;
+                }
+                break;
+            }
+
+#if ADSR_BEZIER_USE_FLOAT
+            uint32_t idx = (uint32_t)((float)delta * _reset_rate_f);
+            if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
+#else
+            uint32_t idx = phaseIndexFixed(delta, _reset_transition, _reset_scale_phase);
+#endif
+            // Fast linear fade down to zero using linear curve table (ADSR_CURVE_LINEAR = 7)
+            int curveVal = _curve_tables[ADSR_CURVE_LINEAR][(int)idx];
+            int32_t out = (int32_t)(((uint32_t)curveVal * _reset_range_scale_q16) >> 16);
+            _adsr_output = (int)out;
+            break;
+        }
+
         case ADSR_PHASE_ATTACK:
         {
             if (_attack == 0)
@@ -669,6 +872,7 @@ public:
             break;
 #endif
         }
+
 #if ADSR_BEZIER_NATIVE_Q15
         // A/D/R: publish bus tap (curve×scale stays in [0, vr] when tables/scales valid).
         _adsr_output_q15 = nativeTapQ15(_adsr_output);
@@ -685,15 +889,20 @@ public:
         return _adsr_output;
     }
 
-    // Q15 from last getWave() (0..ADSR_Q15_ONE ≈ 0..1).
-    // NATIVE_Q15=0: cached remap from DAC. NATIVE_Q15=1: same as getWave domain.
-    int16_t levelQ15() const
+    /**
+     * @brief Get the Q15 amplitude representation from the last getWave() call.
+     * @return int16_t Unipolar Q15 output (0..32767).
+     */
+    int16_t ADSR_BEZIER_HOT(levelQ15)() const
     {
         return _adsr_output_q15;
     }
 
-    // DAC-domain level: identity when NATIVE_Q15=0; Q15→ctor-vr export when NATIVE_Q15=1.
-    int levelDac() const
+    /**
+     * @brief Get the DAC-domain amplitude level.
+     * @return int Scaled integer value matching constructor vertical_resolution.
+     */
+    int ADSR_BEZIER_HOT(levelDac)() const
     {
 #if ADSR_BEZIER_NATIVE_Q15
         return (int)(((uint32_t)_adsr_output * _to_dac_mul) >> 16);
@@ -702,15 +911,23 @@ public:
 #endif
     }
 
-    // Advance envelope and return Q15 level.
-    // Do not call getWave(t) and getWaveQ15(t) in the same tick (double advance).
-    int16_t getWaveQ15()
+    /**
+     * @brief Advance envelope and return unipolar Q15 level using internal timestamp.
+     * @note Do not call both getWave() and getWaveQ15() in the same tick.
+     * @return int16_t Output in Q15 format (0..32767).
+     */
+    int16_t ADSR_BEZIER_HOT(getWaveQ15)()
     {
         getWave();
         return _adsr_output_q15;
     }
 
-    int16_t getWaveQ15(unsigned long t)
+    /**
+     * @brief Advance envelope and return unipolar Q15 level using a caller-supplied timestamp.
+     * @param t Current timestamp in ticks.
+     * @return int16_t Output in Q15 format (0..32767).
+     */
+    int16_t ADSR_BEZIER_HOT(getWaveQ15)(unsigned long t)
     {
         getWave(t);
         return _adsr_output_q15;
@@ -718,8 +935,10 @@ public:
 
 private:
 #if ADSR_BEZIER_NATIVE_Q15
-    // Publish 0..ADSR_Q15_ONE (int16 bus); internal peak may be ADSR_Q15_PEAK (32768).
-    static int16_t nativeTapQ15(int level)
+    /**
+     * @brief Clamps native integer level to unipolar Q15 bus limits (0..ADSR_Q15_ONE).
+     */
+    static ADSR_ALWAYS_INLINE int16_t nativeTapQ15(int level)
     {
         if (level <= 0)
             return 0;
@@ -729,6 +948,9 @@ private:
     }
 #endif
 
+    /**
+     * @brief Binds internal table pointers directly to the active curve LUT arrays.
+     */
     void bindCurvePtrs()
     {
         uint8_t a = (uint8_t)_bezier_attack_type;
@@ -742,8 +964,11 @@ private:
         _curve_release_ptr = _curve_tables[r];
     }
 
-    // Q16 amplitude scale: (range << 16) / vr. Dyadic peak 32768 → range << 1 (no divide).
-    static uint32_t rangeScaleQ16(int32_t range, int vr)
+    /**
+     * @brief Calculates Q16 amplitude scale factor: (range << 16) / vr.
+     *        Dyadic peak 32768 optimizes down to `range << 1` with zero divide.
+     */
+    static ADSR_ALWAYS_INLINE uint32_t rangeScaleQ16(int32_t range, int vr)
     {
         if (range <= 0 || vr <= 0)
             return 0;
@@ -761,7 +986,9 @@ private:
     using phase_scale_t = uint32_t;
 #endif
 
-    // Rounded phase scale: ((ARRAY_SIZE-1)<<SHIFT)/ticks.
+    /**
+     * @brief Calculates rounded phase scale factor: ((ARRAY_SIZE - 1) << SHIFT) / ticks.
+     */
     static phase_scale_t phaseScale(unsigned long phase_ticks)
     {
         if (phase_ticks == 0)
@@ -771,8 +998,10 @@ private:
                                (uint64_t)phase_ticks);
     }
 
-    // idx = (delta * scale) >> SHIFT. U64 mul when PHASE_SHIFT>22 (Q24 A/B).
-    static uint32_t phaseIndexFixed(unsigned long delta, unsigned long phase_ticks, phase_scale_t scale)
+    /**
+     * @brief Converts elapsed delta ticks to a LUT table index via fixed-point multiply-shift.
+     */
+    static ADSR_ALWAYS_INLINE uint32_t phaseIndexFixed(unsigned long delta, unsigned long phase_ticks, phase_scale_t scale)
     {
         uint32_t idx;
         if (scale != 0)
@@ -813,16 +1042,24 @@ private:
     unsigned long _release = 0;
     unsigned long _configured_release = 0;
     bool _reset_attack = false;
+    unsigned long _reset_transition = 0; // Anti-click slew duration (ticks)
+    int _reset_start_level = 0;          // Output anchor level at start of reset transition
 
 #if !ADSR_BEZIER_USE_FLOAT
     phase_scale_t _attack_scale_phase = 0;
     phase_scale_t _decay_scale_phase = 0;
     phase_scale_t _release_scale_phase = 0;
+    phase_scale_t _reset_scale_phase = 0;
 #endif
 
+    /**
+     * @enum ADSRPhase
+     * @brief Internal envelope generator lifecycle states.
+     */
     enum ADSRPhase
     {
         ADSR_PHASE_IDLE = 0,
+        ADSR_PHASE_RESET_TRANSITION,
         ADSR_PHASE_ATTACK,
         ADSR_PHASE_DECAY,
         ADSR_PHASE_SUSTAIN,
@@ -836,12 +1073,14 @@ private:
     float _attack_rate_f = 0.0f;
     float _decay_rate_f = 0.0f;
     float _release_rate_f = 0.0f;
+    float _reset_rate_f = 0.0f;
 #endif
 
     // Unified Amplitude scaling - universally fast on all platforms
     uint32_t _attack_range_scale_q16 = 0;
     uint32_t _decay_range_scale_q16 = 0;
     uint32_t _release_range_scale_q16 = 0;
+    uint32_t _reset_range_scale_q16 = 0;
 
     int _adsr_output;
     int16_t _adsr_output_q15 = 0;
@@ -857,13 +1096,24 @@ private:
 // BÉZIER TABLE GENERATION HELPERS
 // =================================================================
 
-// Lightweight point type used for table generation
+/**
+ * @struct ADSRBezierPoint
+ * @brief Lightweight 2D floating-point coordinate for Bézier solver.
+ */
 struct ADSRBezierPoint
 {
     float x, y;
 };
 
-// Evaluate a cubic Bézier at parameter t in [0, 1]
+/**
+ * @brief Evaluates cubic Bézier coordinates at normalized progress parameter t.
+ * @param A  Start point coordinate (0, maxVal).
+ * @param P1 First control handle coordinate.
+ * @param P2 Second control handle coordinate.
+ * @param B  End point coordinate (maxVal, 0).
+ * @param t  Normalized parametric progress in [0.0, 1.0].
+ * @return ADSRBezierPoint Evaluated 2D position.
+ */
 inline ADSRBezierPoint adsrBezierCubic(const ADSRBezierPoint &A,
                                        const ADSRBezierPoint &P1,
                                        const ADSRBezierPoint &P2,
@@ -887,7 +1137,16 @@ inline ADSRBezierPoint adsrBezierCubic(const ADSRBezierPoint &A,
     return {x, y};
 }
 
-// Find y for a given x on the cubic Bézier using binary search on t
+/**
+ * @brief Binary-search inversion to solve Y given target X along a Bézier curve.
+ * @param A       Start point coordinate.
+ * @param P1      First control handle coordinate.
+ * @param P2      Second control handle coordinate.
+ * @param B       End point coordinate.
+ * @param xTarget Target X progress coordinate.
+ * @param tol     Convergence tolerance.
+ * @return float  Solved Y coordinate corresponding to xTarget.
+ */
 inline float adsrBezierFindYForX(const ADSRBezierPoint &A,
                                  const ADSRBezierPoint &P1,
                                  const ADSRBezierPoint &P2,
@@ -917,12 +1176,13 @@ inline float adsrBezierFindYForX(const ADSRBezierPoint &A,
     return resultPoint.y;
 }
 
-// Generate 8 Bézier curves into the provided curve_tables (size [8][numPoints])
-// maxVal: maximum y value (e.g. vertical_resolution or ADSR_Q15_ONE)
-// numPoints: number of points per curve (ARRAY_SIZE)
-//
-// P1/P2 literals are authored near 12-bit CV (~4095); scale by maxVal/4096 (2^12)
-// so shapes stay consistent at Q15 peak (NATIVE_Q15) with an exact dyadic factor.
+/**
+ * @brief Generates 8 pre-authored Bézier curve profiles into the global lookup tables.
+ *        P1/P2 literals are authored near 12-bit CV (~4095) and scaled by maxVal/4096 (2^12)
+ *        so shapes remain consistent at Q15 peak with an exact dyadic factor.
+ * @param maxVal    Maximum amplitude value (e.g. vertical_resolution or ADSR_Q15_PEAK).
+ * @param numPoints Number of points per curve array (default: ARRAY_SIZE = 1024).
+ */
 inline void adsrBezierInitTables(float maxVal, int numPoints = ARRAY_SIZE)
 {
     ADSRBezierPoint A = {0.0f, maxVal};
