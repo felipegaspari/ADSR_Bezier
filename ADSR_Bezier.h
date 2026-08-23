@@ -106,22 +106,38 @@
 #endif
 
 #if ADSR_BEZIER_SRAM_HOT
-#ifndef __not_in_flash_func
-#define __not_in_flash_func(fn) fn
-#endif
-#define ADSR_BEZIER_HOT(fn) __not_in_flash_func(fn)
+
+  /* ---------- Raspberry Pi Pico / RP2040 / RP2350 ---------- */
+  #if defined(ARDUINO_ARCH_RP2040) || defined(PICO_RP2040) || defined(PICO_RP2350)
+    #ifndef __not_in_flash_func
+      #define __not_in_flash_func(fn) fn
+    #endif
+    #define ADSR_BEZIER_HOT(fn) __not_in_flash_func(fn)
+
+  /* ---------- STM32H7 (ITCM – fastest instruction RAM) ---------- */
+  #elif defined(STM32H7) || defined(STM32H750xx) || defined(ARDUINO_ARCH_STM32)
+    /* Function goes into .itcmram section (linker + startup copy required) */
+    #define ADSR_BEZIER_HOT(fn) __attribute__((section(".itcmram"), noinline, used)) fn
+
+  /* ---------- Fallback ---------- */
+  #else
+    #define ADSR_BEZIER_HOT(fn) fn
+  #endif
+
 #else
-#define ADSR_BEZIER_HOT(fn) fn
+  /* Portable fallback (no special placement) */
+  #define ADSR_BEZIER_HOT(fn) fn
 #endif
 
-// Always-inline attribute to guarantee zero Flash branching in hot loops
+/* Always-inline attribute to guarantee zero Flash branching in hot loops */
 #ifndef ADSR_ALWAYS_INLINE
-#if defined(__GNUC__) || defined(__clang__)
-#define ADSR_ALWAYS_INLINE __attribute__((always_inline)) inline
-#else
-#define ADSR_ALWAYS_INLINE inline
+  #if defined(__GNUC__) || defined(__clang__)
+    #define ADSR_ALWAYS_INLINE __attribute__((always_inline)) inline
+  #else
+    #define ADSR_ALWAYS_INLINE inline
+  #endif
 #endif
-#endif
+
 
 // Emit active config once per translation unit (visible in compile logs)
 #ifndef ADSR_BEZIER_CONFIG_REPORTED
@@ -245,7 +261,6 @@ inline const char* adsrGetCurveName(uint8_t curve)
 
 // Global Bézier lookup tables (inline storage allocated across translation units)
 inline int _curve_tables[8][ARRAY_SIZE];
-inline int _curve_attack_tables[8][ARRAY_SIZE];
 
 // =================================================================
 // ADSR ENVELOPE CLASS DEFINITION
@@ -776,7 +791,8 @@ public:
 #else
             uint32_t idx = phaseIndexFixed(delta, _attack, _attack_scale_phase);
 #endif
-            int curveVal = _curve_attack_ptr[(int)idx];
+            // Read _curve_tables backwards:
+            int curveVal = _curve_attack_ptr[(ARRAY_SIZE - 1) - (int)idx];
 
             int32_t out = (int32_t)_attack_start +
               (int32_t)(((uint32_t)curveVal * _attack_range_scale_q16) >> 16);
@@ -959,7 +975,7 @@ private:
         if (a >= ADSR_NUM_CURVES) a = ADSR_NUM_CURVES - 1;
         if (d >= ADSR_NUM_CURVES) d = ADSR_NUM_CURVES - 1;
         if (r >= ADSR_NUM_CURVES) r = ADSR_NUM_CURVES - 1;
-        _curve_attack_ptr = _curve_attack_tables[a];
+        _curve_attack_ptr = _curve_tables[a];
         _curve_decay_ptr = _curve_tables[d];
         _curve_release_ptr = _curve_tables[r];
     }
@@ -1147,33 +1163,35 @@ inline ADSRBezierPoint adsrBezierCubic(const ADSRBezierPoint &A,
  * @param tol     Convergence tolerance.
  * @return float  Solved Y coordinate corresponding to xTarget.
  */
-inline float adsrBezierFindYForX(const ADSRBezierPoint &A,
-                                 const ADSRBezierPoint &P1,
-                                 const ADSRBezierPoint &P2,
-                                 const ADSRBezierPoint &B,
-                                 float xTarget,
-                                 float tol = 1e-5f)
+ inline float adsrBezierFindYForX(const ADSRBezierPoint &A,
+    const ADSRBezierPoint &P1,
+    const ADSRBezierPoint &P2,
+    const ADSRBezierPoint &B,
+    float xTarget,
+    float tol = 1e-5f)
 {
-    float tLow = 0.0f;
-    float tHigh = 1.0f;
-    float tMid = 0.0f;
+float tLow = 0.0f;
+float tHigh = 1.0f;
+float yResult = A.y;
 
-    for (int iter = 0; iter < 64 && (tHigh - tLow) > tol; ++iter)
-    {
-        tMid = (tLow + tHigh) * 0.5f;
-        ADSRBezierPoint midPoint = adsrBezierCubic(A, P1, P2, B, tMid);
-        if (midPoint.x < xTarget)
-        {
-            tLow = tMid;
-        }
-        else
-        {
-            tHigh = tMid;
-        }
-    }
+// 16 iterations gives 1/65536 precision (plenty for 12-bit DACs)
+for (int iter = 0; iter < 16 && (tHigh - tLow) > tol; ++iter)
+{
+float tMid = (tLow + tHigh) * 0.5f;
+ADSRBezierPoint midPoint = adsrBezierCubic(A, P1, P2, B, tMid);
+yResult = midPoint.y;
 
-    ADSRBezierPoint resultPoint = adsrBezierCubic(A, P1, P2, B, tMid);
-    return resultPoint.y;
+if (midPoint.x < xTarget)
+{
+tLow = tMid;
+}
+else
+{
+tHigh = tMid;
+}
+}
+
+return yResult;
 }
 
 /**
@@ -1213,10 +1231,6 @@ inline void adsrBezierInitTables(float maxVal, int numPoints = ARRAY_SIZE)
             float yResult = adsrBezierFindYForX(A, P1, P2, B, xTarget);
 
             _curve_tables[j][i] = (int)roundf(yResult);
-        }
-        for (int i = 0; i < numPoints; ++i)
-        {
-            _curve_attack_tables[j][i] = _curve_tables[j][numPoints - 1 - i];
         }
     }
 }

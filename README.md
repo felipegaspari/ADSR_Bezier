@@ -358,18 +358,18 @@ Each voice carries **three** envelope instances: EnvDCO (pitch/PW), EnvVCA, EnvV
 static constexpr uint16_t ADSR_1_CC = 4000;
 static constexpr uint16_t ADSR_CV_CC = 4095;
 
-adsr adsr1_voice_0(ADSR_1_CC, ADSR1_curve1, ADSR1_curve2, false, 7, 7, 7);
+adsr adsr3_voice_0(ADSR_1_CC, ADSR3_curve1, ADSR3_curve2, false, 7, 7, 7);
 adsr adsr_vca_voice_0(ADSR_CV_CC, ADSR_VCA_curve1, ADSR_VCA_curve2, false, 1, 2, 1);
 adsr adsr_vcf_voice_0(ADSR_CV_CC, ADSR_VCF_curve1, ADSR_VCF_curve2, false, 4, 6, 1);
 
 struct ADSRStruct {
-  adsr adsr1_voice;
+  adsr adsr3_voice;
   adsr adsr_vca_voice;
   adsr adsr_vcf_voice;
 };
 
 ADSRStruct ADSRVoices[] = {
-  { adsr1_voice_0, adsr_vca_voice_0, adsr_vcf_voice_0 },
+  { adsr3_voice_0, adsr_vca_voice_0, adsr_vcf_voice_0 },
 };
 ```
 
@@ -387,11 +387,11 @@ void init_ADSR() {
   adsrBezierInitTables((float)ADSR_Q15_ONE, ARRAY_SIZE, _curve_tables);
 
   for (int i = 0; i < NUM_VOICES_TOTAL; i++) {
-    ADSRVoices[i].adsr1_voice.setAttack(ADSR1_attack);
-    ADSRVoices[i].adsr1_voice.setDecay(ADSR1_decay);
-    ADSRVoices[i].adsr1_voice.setSustain(adsr_sustain_for_set(ADSR1_sustain, ADSR_1_CC));
-    ADSRVoices[i].adsr1_voice.setRelease(ADSR1_release);
-    ADSRVoices[i].adsr1_voice.setResetAttack(ADSRRestart);
+    ADSRVoices[i].adsr3_voice.setAttack(ADSR3_attack);
+    ADSRVoices[i].adsr3_voice.setDecay(ADSR3_decay);
+    ADSRVoices[i].adsr3_voice.setSustain(adsr_sustain_for_set(ADSR3_sustain, ADSR_1_CC));
+    ADSRVoices[i].adsr3_voice.setRelease(ADSR3_release);
+    ADSRVoices[i].adsr3_voice.setResetAttack(ADSRRestart);
 
     ADSRVoices[i].adsr_vca_voice.setAttack(ADSR_VCA_attack);
     // ... decay, sustain (Q15), release, setResetAttack for VCA and VCF ...
@@ -407,8 +407,8 @@ Note edges only — **no setter spam on `noteOn`** (params stay current via `ADS
 inline void ADSR_update() {
   for (int i = 0; i < NUM_VOICES; i++) {
     // noteStart[] / noteEnd[] → noteOn/noteOff on EnvDCO, EnvVCA, EnvVCF, EnvVCF2
-    ADSR1Level[i] = ADSRVoices[i].adsr1_voice.getWave();
-    ADSR1Level_q15[i] = ADSRVoices[i].adsr1_voice.levelQ15();
+    ADSR3Level[i] = ADSRVoices[i].adsr3_voice.getWave();
+    ADSR3Level_q15[i] = ADSRVoices[i].adsr3_voice.levelQ15();
     ADSR_VCA_Level[i] = ADSRVoices[i].adsr_vca_voice.getWave();
     ADSR_VCA_Level_q15[i] = ADSRVoices[i].adsr_vca_voice.levelQ15();
   }
