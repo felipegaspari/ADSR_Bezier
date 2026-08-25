@@ -260,7 +260,7 @@ inline const char* adsrGetCurveName(uint8_t curve)
 }
 
 // Global Bézier lookup tables (inline storage allocated across translation units)
-inline int _curve_tables[8][ARRAY_SIZE];
+SRAM_DATA int _curve_tables[8][ARRAY_SIZE];
 
 // =================================================================
 // ADSR ENVELOPE CLASS DEFINITION
