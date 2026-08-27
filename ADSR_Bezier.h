@@ -34,7 +34,7 @@
  *        - Default is 2000 us (2.0 ms) which eliminates DC clicks without perceptible latency.
  */
 #ifndef ADSR_BEZIER_RESET_TRANSITION_US
-#define ADSR_BEZIER_RESET_TRANSITION_US 1000UL
+#define ADSR_BEZIER_RESET_TRANSITION_US 3000UL
 #endif
 
 /**
@@ -386,19 +386,22 @@ public:
         if (_phase == ADSR_PHASE_RELEASE)
         {
             unsigned long now;
-#if ADSR_BEZIER_USE_MICROS
-            now = micros();
-#else
-            now = millis();
-#endif
-            unsigned long elapsed = now - _t_phase_start;
-            
-            // Calculate remaining release time
-            if (elapsed < _release) {
-                _release -= elapsed;
-            } else {
-                _release = 0;
-            }
+            #if ADSR_BEZIER_USE_MICROS
+                        now = micros();
+            #else
+                        now = millis();
+            #endif
+                        unsigned long elapsed = now - _t_phase_start;
+                        
+                        // Anti-skew clamp
+                        if (elapsed > 0x7FFFFFFFUL) elapsed = 0;
+                        
+                        // Calculate remaining release time
+                        if (elapsed < _release) {
+                            _release -= elapsed;
+                        } else {
+                            _release = 0;
+                        }
 
             _release_start = _adsr_output;
             _t_phase_start = now;
@@ -420,6 +423,23 @@ public:
         _bezier_release_type = curve_type;
         bindCurvePtrs();
     }
+
+    /**
+     * @brief Sets the envelope output mode.
+     * @param mode 0: Normal (0..32767)
+     *             1: Centered (-32768..32767)
+     *             2: Inverted (0..-32767)
+     */
+     void setMode(uint8_t mode)
+     {
+         if (_mode != mode) {
+             _mode = mode;
+             invalidateQ15Cache(); // Force recalculation on next fetch
+         }
+     }
+ 
+     uint8_t getMode() const { return _mode; }
+
 
     /**
      * @brief Enable or disable attack phase restart behavior on Note On.
@@ -504,10 +524,6 @@ public:
 #endif
     }
 
-    /**
-     * @brief Set Attack duration in milliseconds.
-     * @param l_attack_ms Attack time in ms.
-     */
     void setAttack(unsigned long l_attack_ms)
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -515,6 +531,19 @@ public:
 #else
         unsigned long attack_ticks = l_attack_ms;
 #endif
+        if (_phase == ADSR_PHASE_ATTACK && attack_ticks != _attack)
+        {
+            _attack_start = _adsr_output;
+#if ADSR_BEZIER_USE_MICROS
+            _t_phase_start = micros();
+#else
+            _t_phase_start = millis();
+#endif
+            int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
+            if (range < 0) range = 0;
+            _attack_range_scale_q16 = rangeScaleQ16(range, _vertical_resolution);
+            invalidateQ15Cache();
+        }
         _attack = attack_ticks;
 
 #if ADSR_BEZIER_USE_FLOAT
@@ -523,15 +552,10 @@ public:
         else
             _attack_rate_f = 0.0f;
 #else
-        // Phase scale: idx = (delta * scale) >> PHASE_SHIFT; scale=0 → divide fallback.
         _attack_scale_phase = phaseScale(_attack);
 #endif
     }
 
-    /**
-     * @brief Set Decay duration in milliseconds.
-     * @param l_decay_ms Decay time in ms.
-     */
     void setDecay(unsigned long l_decay_ms)
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -539,6 +563,19 @@ public:
 #else
         unsigned long decay_ticks = l_decay_ms;          
 #endif
+        if (_phase == ADSR_PHASE_DECAY && decay_ticks != _decay)
+        {
+            _decay_start = _adsr_output;
+#if ADSR_BEZIER_USE_MICROS
+            _t_phase_start = micros();
+#else
+            _t_phase_start = millis();
+#endif
+            int32_t dr = (int32_t)_decay_start - (int32_t)_sustain;
+            if (dr < 0) dr = 0;
+            _decay_range_scale_q16 = rangeScaleQ16(dr, _vertical_resolution);
+            invalidateQ15Cache();
+        }
         _decay = decay_ticks;
 
 #if ADSR_BEZIER_USE_FLOAT
@@ -551,30 +588,31 @@ public:
 #endif
     }
 
-    /**
-     * @brief Set Sustain level.
-     * @param l_sustain Target sustain level (0..vertical_resolution when NATIVE_Q15=0;
-     *                  0..ADSR_Q15_PEAK when NATIVE_Q15=1).
-     */
     void setSustain(int l_sustain)
     {
-        if (l_sustain < 0)
-            l_sustain = 0;
-        if (l_sustain >= _vertical_resolution)
-            l_sustain = _vertical_resolution;
+        if (l_sustain < 0) l_sustain = 0;
+        if (l_sustain >= _vertical_resolution) l_sustain = _vertical_resolution;
+        if (_sustain == l_sustain) return;
         _sustain = l_sustain;
 
-        int32_t range = (int32_t)_vertical_resolution - (int32_t)_sustain;
+        if (_phase == ADSR_PHASE_DECAY) {
+            _decay_start = _adsr_output;
+#if ADSR_BEZIER_USE_MICROS
+            _t_phase_start = micros();
+#else
+            _t_phase_start = millis();
+#endif
+        } else if (_phase != ADSR_PHASE_SUSTAIN && _phase != ADSR_PHASE_RELEASE) {
+            _decay_start = _vertical_resolution;
+        }
+
+        int32_t range = (int32_t)_decay_start - (int32_t)_sustain;
         if (range < 0) range = 0;
 
         _decay_range_scale_q16 = rangeScaleQ16(range, _vertical_resolution);
         invalidateQ15Cache();
     }
 
-    /**
-     * @brief Set Release duration in milliseconds.
-     * @param l_release_ms Release time in ms.
-     */
     void setRelease(unsigned long l_release_ms)
     {
 #if ADSR_BEZIER_USE_MICROS
@@ -582,6 +620,20 @@ public:
 #else
         unsigned long release_ticks = l_release_ms;          
 #endif
+        if (_phase == ADSR_PHASE_RELEASE && release_ticks != _configured_release)
+        {
+            _release_start = _adsr_output;
+#if ADSR_BEZIER_USE_MICROS
+            _t_phase_start = micros();
+#else
+            _t_phase_start = millis();
+#endif
+            int32_t rs = (int32_t)_release_start;
+            if (rs < 0) rs = 0;
+            if (rs > _vertical_resolution) rs = _vertical_resolution;
+            _release_range_scale_q16 = rangeScaleQ16(rs, _vertical_resolution);
+            invalidateQ15Cache();
+        }
         _release = release_ticks;
         _configured_release = _release;
 
@@ -600,55 +652,83 @@ public:
      *        If resetAttack is enabled and current level > 0, safely initiates
      *        a soft ramp-down transition before advancing to the Attack phase.
      */
-    void ADSR_BEZIER_HOT(noteOn)()
-    {
-        unsigned long now;
-#if ADSR_BEZIER_USE_MICROS
-        now = micros();
-#else
-        now = millis();
-#endif
-        // One gate per instance. Retrigger without a leading noteOff.
-        _notes_pressed = 1;
-
-        if (_reset_attack)
-        {
-            // If already at zero level or transition disabled (0 ticks), enter Attack immediately
-            if (_adsr_output <= 0 || _reset_transition == 0)
-            {
-                _attack_start = 0;
-                _phase = ADSR_PHASE_ATTACK;
-                _t_phase_start = now;
-
-                _attack_range_scale_q16 = rangeScaleQ16((int32_t)_vertical_resolution, _vertical_resolution);
-                invalidateQ15Cache();
-            }
-            else
-            {
-                // Soft ramp down to 0 before launching attack
-                _reset_start_level = _adsr_output;
-                if (_reset_start_level > _vertical_resolution) _reset_start_level = _vertical_resolution;
-
-                _phase = ADSR_PHASE_RESET_TRANSITION;
-                _t_phase_start = now;
-
-                _reset_range_scale_q16 = rangeScaleQ16((int32_t)_reset_start_level, _vertical_resolution);
-                invalidateQ15Cache();
-            }
-        }
-        else
-        {
-            _attack_start = _adsr_output;
-            _phase = ADSR_PHASE_ATTACK;
-            _t_phase_start = now;
-
-            int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
-            if (range < 0) range = 0;
-
-            _attack_range_scale_q16 = rangeScaleQ16(range, _vertical_resolution);
-            invalidateQ15Cache();
-        }
-    }
+     void ADSR_BEZIER_HOT(noteOn)()
+     {
+         unsigned long now;
+ #if ADSR_BEZIER_USE_MICROS
+         now = micros();
+ #else
+         now = millis();
+ #endif
+         _notes_pressed = 1;
+ 
+         if (_reset_attack)
+         {
+             // Restart ON: fade down to 0 first
+             if (_adsr_output <= 0 || _reset_transition == 0)
+             {
+                 _attack_start = 0;
+                 _phase = ADSR_PHASE_ATTACK;
+                 _t_phase_start = now;
+ 
+                 _active_attack = _attack;
+ #if ADSR_BEZIER_USE_FLOAT
+                 _active_attack_rate_f = _attack_rate_f;
+ #else
+                 _active_attack_scale_phase = _attack_scale_phase;
+ #endif
+                 _attack_range_scale_q16 = rangeScaleQ16((int32_t)_vertical_resolution, _vertical_resolution);
+                 invalidateQ15Cache();
+             }
+             else
+             {
+                 _reset_start_level = _adsr_output;
+                 if (_reset_start_level > _vertical_resolution) _reset_start_level = _vertical_resolution;
+ 
+                 _phase = ADSR_PHASE_RESET_TRANSITION;
+                 _t_phase_start = now;
+ 
+                 _reset_range_scale_q16 = rangeScaleQ16((int32_t)_reset_start_level, _vertical_resolution);
+                 invalidateQ15Cache();
+             }
+         }
+         else
+         {
+             // Restart OFF (Legato): Ramp from CURRENT level to Peak (100%)
+             _attack_start = _adsr_output;
+             if (_attack_start < 0) _attack_start = 0;
+             if (_attack_start > _vertical_resolution) _attack_start = _vertical_resolution;
+ 
+             _phase = ADSR_PHASE_ATTACK;
+             _t_phase_start = now;
+ 
+             // If attack is 0, use the anti-click transition time to ramp up safely
+             if (_attack == 0 && _reset_transition > 0)
+             {
+                 _active_attack = _reset_transition;
+ #if ADSR_BEZIER_USE_FLOAT
+                 _active_attack_rate_f = _reset_rate_f;
+ #else
+                 _active_attack_scale_phase = _reset_scale_phase;
+ #endif
+             }
+             else
+             {
+                 _active_attack = _attack;
+ #if ADSR_BEZIER_USE_FLOAT
+                 _active_attack_rate_f = _attack_rate_f;
+ #else
+                 _active_attack_scale_phase = _attack_scale_phase;
+ #endif
+             }
+ 
+             int32_t range = (int32_t)_vertical_resolution - (int32_t)_attack_start;
+             if (range < 0) range = 0;
+ 
+             _attack_range_scale_q16 = rangeScaleQ16(range, _vertical_resolution);
+             invalidateQ15Cache();
+         }
+     }
 
     /**
      * @brief Trigger Note Off event using current internal timestamp.
@@ -694,216 +774,234 @@ public:
 #endif
     }
 
+
     /**
      * @brief Advance envelope and compute current sample using a caller-supplied timestamp.
      * @param l_ticks Current timestamp in ticks (micros or millis matching ADSR_BEZIER_USE_MICROS).
      * @return int Output value in native domain.
      */
-    int ADSR_BEZIER_HOT(getWave)(unsigned long l_ticks)
-    {
-#if ADSR_BEZIER_NATIVE_Q15
-        // Sustain/idle: no index/table/mul; publish Q15 tap (0..ADSR_Q15_ONE).
-        if (_phase == ADSR_PHASE_SUSTAIN) {
-            _adsr_output = _sustain;
-            _adsr_output_q15 = nativeTapQ15(_sustain);
-            return (int)_adsr_output_q15;
-        }
-        if (_phase == ADSR_PHASE_IDLE) {
-            _adsr_output = 0;
-            _adsr_output_q15 = 0;
-            return 0;
-        }
-#endif
-        unsigned long delta = 0;
-
-        switch (_phase)
-        {
-        case ADSR_PHASE_RESET_TRANSITION:
-        {
-            delta = l_ticks - _t_phase_start;
-            if (delta >= _reset_transition)
+     int ADSR_BEZIER_HOT(getWave)(unsigned long l_ticks)
+     {
+ #if ADSR_BEZIER_NATIVE_Q15
+         // Sustain/idle: no index/table/mul; publish Q15 tap (0..ADSR_Q15_ONE).
+         if (_phase == ADSR_PHASE_SUSTAIN) {
+             _adsr_output = _sustain;
+             int32_t q = nativeTapQ15(_sustain);
+             if (_mode == 1) q = (q - 16384) << 1;
+             else if (_mode == 2) q = -q;
+             _adsr_output_q15 = (int16_t)q;
+             return (int)_adsr_output_q15;
+         }
+         if (_phase == ADSR_PHASE_IDLE) {
+             _adsr_output = 0;
+             int32_t q = 0;
+             if (_mode == 1) q = -32768;
+             else if (_mode == 2) q = 0;
+             _adsr_output_q15 = (int16_t)q;
+             return (int)_adsr_output_q15;
+         }
+ #endif
+ 
+         // --- TIMING SKEW PROTECTION ---
+         // If caller uses a cached timestamp slightly older than the internal 
+         // micros() fetched during noteOn(), delta will underflow to a huge value.
+         // We clamp these negative skews to 0 to prevent instantly skipping phases.
+         unsigned long delta = l_ticks - _t_phase_start;
+         if (delta > 0x7FFFFFFFUL) {
+             delta = 0; 
+         }
+ 
+         switch (_phase)
+         {
+            case ADSR_PHASE_RESET_TRANSITION:
             {
-                _adsr_output = 0;
-                _attack_start = 0;
-                _t_phase_start = l_ticks;
-                _attack_range_scale_q16 = rangeScaleQ16((int32_t)_vertical_resolution, _vertical_resolution);
-
-                if (_attack == 0)
+                if (delta >= _reset_transition)
                 {
-                    _adsr_output = _vertical_resolution;
-                    if (_decay > 0) {
-                        _phase = ADSR_PHASE_DECAY;
-                    } else {
-                        _phase = ADSR_PHASE_SUSTAIN;
+                    // 1. Reset floor to 0
+                    _adsr_output = 0;
+                    _attack_start = 0;
+                    _t_phase_start = l_ticks;
+                    _attack_range_scale_q16 = rangeScaleQ16((int32_t)_vertical_resolution, _vertical_resolution);
+    
+                    // 2. Properly initialize active attack parameters for the Attack phase
+                    if (_attack == 0 && _reset_transition > 0)
+                    {
+                        _active_attack = _reset_transition;
+    #if ADSR_BEZIER_USE_FLOAT
+                        _active_attack_rate_f = _reset_rate_f;
+    #else
+                        _active_attack_scale_phase = _reset_scale_phase;
+    #endif
                     }
-                }
-                else
-                {
+                    else
+                    {
+                        _active_attack = _attack;
+    #if ADSR_BEZIER_USE_FLOAT
+                        _active_attack_rate_f = _attack_rate_f;
+    #else
+                        _active_attack_scale_phase = _attack_scale_phase;
+    #endif
+                    }
+    
+                    // 3. Launch Attack phase from 0
                     _phase = ADSR_PHASE_ATTACK;
+                    break;
                 }
+    
+    #if ADSR_BEZIER_USE_FLOAT
+                uint32_t idx = (uint32_t)((float)delta * _reset_rate_f);
+                if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
+    #else
+                uint32_t idx = phaseIndexFixed(delta, _reset_transition, _reset_scale_phase);
+    #endif
+                // Linear fade down to zero
+                int curveVal = _curve_tables[ADSR_CURVE_LINEAR][(int)idx];
+                int32_t out = (int32_t)(((uint32_t)curveVal * _reset_range_scale_q16) >> 16);
+                _adsr_output = (int)out;
                 break;
             }
-
-#if ADSR_BEZIER_USE_FLOAT
-            uint32_t idx = (uint32_t)((float)delta * _reset_rate_f);
-            if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
-#else
-            uint32_t idx = phaseIndexFixed(delta, _reset_transition, _reset_scale_phase);
-#endif
-            // Fast linear fade down to zero using linear curve table (ADSR_CURVE_LINEAR = 7)
-            int curveVal = _curve_tables[ADSR_CURVE_LINEAR][(int)idx];
-            int32_t out = (int32_t)(((uint32_t)curveVal * _reset_range_scale_q16) >> 16);
-            _adsr_output = (int)out;
-            break;
-        }
-
-        case ADSR_PHASE_ATTACK:
-        {
-            if (_attack == 0)
-            {
-                _adsr_output = _vertical_resolution;
-                if (_decay > 0) {
-                    _phase = ADSR_PHASE_DECAY;
-                    _t_phase_start = l_ticks;
-                } else {
-                    _phase = ADSR_PHASE_SUSTAIN;
-                }
-                break;
-            }
-
-            delta = l_ticks - _t_phase_start;
-
-            if (delta >= _attack)
-            {
-                _adsr_output = _vertical_resolution;
-                if (_decay > 0) {
-                    _phase = ADSR_PHASE_DECAY;
-                    _t_phase_start = l_ticks;
-                } else {
-                    _phase = ADSR_PHASE_SUSTAIN;
-                }
-                break;
-            }
-
-#if ADSR_BEZIER_USE_FLOAT
-            uint32_t idx = (uint32_t)((float)delta * _attack_rate_f);
-            if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
-#else
-            uint32_t idx = phaseIndexFixed(delta, _attack, _attack_scale_phase);
-#endif
-            // Read _curve_tables backwards:
-            int curveVal = _curve_attack_ptr[(ARRAY_SIZE - 1) - (int)idx];
-
-            int32_t out = (int32_t)_attack_start +
-              (int32_t)(((uint32_t)curveVal * _attack_range_scale_q16) >> 16);
-
-            _adsr_output = (int)out;
-            break;
-        }
-
-        case ADSR_PHASE_DECAY:
-        {
-            if (_decay == 0)
-            {
-                _adsr_output = _sustain;
-                _phase = ADSR_PHASE_SUSTAIN;
-                break;
-            }
-
-            delta = l_ticks - _t_phase_start;
-
-            if (delta >= _decay)
-            {
-                _adsr_output = _sustain;
-                _phase = ADSR_PHASE_SUSTAIN;
-                break;
-            }
-
-#if ADSR_BEZIER_USE_FLOAT
-            uint32_t idx = (uint32_t)((float)delta * _decay_rate_f);
-            if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
-#else
-            uint32_t idx = phaseIndexFixed(delta, _decay, _decay_scale_phase);
-#endif
-
-            int curveVal = _curve_decay_ptr[(int)idx];
-
-            int32_t out = (int32_t)_sustain +
-              (int32_t)(((uint32_t)curveVal * _decay_range_scale_q16) >> 16);
-
-            _adsr_output = (int)out;
-            break;
-        }
-
-        case ADSR_PHASE_SUSTAIN:
-        {
-            _adsr_output = _sustain;
-            break;
-        }
-
-        case ADSR_PHASE_RELEASE:
-        {
-            if (_release == 0)
-            {
-                _adsr_output = 0;
-                _phase = ADSR_PHASE_IDLE;
-                break;
-            }
-
-            delta = l_ticks - _t_phase_start;
-
-            if (delta >= _release)
-            {
-                _adsr_output = 0;
-                _phase = ADSR_PHASE_IDLE;
-                break;
-            }
-
-#if ADSR_BEZIER_USE_FLOAT
-            uint32_t idx = (uint32_t)((float)delta * _release_rate_f);
-            if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
-#else
-            uint32_t idx = phaseIndexFixed(delta, _release, _release_scale_phase);
-#endif
-
-            int curveVal = _curve_release_ptr[(int)idx];
-
-            int32_t out =
-              (int32_t)(((uint32_t)curveVal * _release_range_scale_q16) >> 16);
-
-            _adsr_output = (int)out;
-            break;
-        }
-
-#if !ADSR_BEZIER_NATIVE_Q15
-        case ADSR_PHASE_IDLE:
-        default:
-        {
-            _adsr_output = 0;
-            break;
-        }
-#else
-        default:
-            _adsr_output = 0;
-            break;
-#endif
-        }
-
-#if ADSR_BEZIER_NATIVE_Q15
-        // A/D/R: publish bus tap (curve×scale stays in [0, vr] when tables/scales valid).
-        _adsr_output_q15 = nativeTapQ15(_adsr_output);
-        return (int)_adsr_output_q15;
-#elif ADSR_BEZIER_UPDATE_Q15_CACHE
-        // Q15 cache: skip mul when DAC level unchanged (sustain/idle).
-        if (_adsr_output != _adsr_output_q15_src) {
-            _adsr_output_q15_src = _adsr_output;
-            uint32_t q = ((uint32_t)_adsr_output * _to_q15_mul) >> 16;
-            if (q > (uint32_t)ADSR_Q15_ONE) q = (uint32_t)ADSR_Q15_ONE;
-            _adsr_output_q15 = (int16_t)q;
-        }
-#endif
-        return _adsr_output;
-    }
+         
+         case ADSR_PHASE_ATTACK:
+         {
+             if (_active_attack == 0 || delta >= _active_attack)
+             {
+                 _adsr_output = _vertical_resolution;
+                 if (_decay > 0) {
+                     _phase = ADSR_PHASE_DECAY;
+                     _t_phase_start = l_ticks;
+                     _decay_start = _vertical_resolution;
+                     int32_t dr = (int32_t)_decay_start - (int32_t)_sustain;
+                     if (dr < 0) dr = 0;
+                     _decay_range_scale_q16 = rangeScaleQ16(dr, _vertical_resolution);
+                 } else {
+                     _phase = ADSR_PHASE_SUSTAIN;
+                 }
+                 break;
+             }
+ 
+ #if ADSR_BEZIER_USE_FLOAT
+             uint32_t idx = (uint32_t)((float)delta * _active_attack_rate_f);
+             if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
+ #else
+             uint32_t idx = phaseIndexFixed(delta, _active_attack, _active_attack_scale_phase);
+ #endif
+             // Read curve table backwards to ramp from 0 to max
+             int curveVal = _curve_attack_ptr[(ARRAY_SIZE - 1) - (int)idx];
+ 
+             int32_t out = (int32_t)_attack_start +
+               (int32_t)(((uint32_t)curveVal * _attack_range_scale_q16) >> 16);
+ 
+             _adsr_output = (int)out;
+             break;
+         }
+ 
+         case ADSR_PHASE_DECAY:
+         {
+             if (_decay == 0)
+             {
+                 _adsr_output = _sustain;
+                 _phase = ADSR_PHASE_SUSTAIN;
+                 break;
+             }
+ 
+             if (delta >= _decay)
+             {
+                 _adsr_output = _sustain;
+                 _phase = ADSR_PHASE_SUSTAIN;
+                 break;
+             }
+ 
+ #if ADSR_BEZIER_USE_FLOAT
+             uint32_t idx = (uint32_t)((float)delta * _decay_rate_f);
+             if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
+ #else
+             uint32_t idx = phaseIndexFixed(delta, _decay, _decay_scale_phase);
+ #endif
+ 
+             int curveVal = _curve_decay_ptr[(int)idx];
+ 
+             int32_t out = (int32_t)_sustain +
+               (int32_t)(((uint32_t)curveVal * _decay_range_scale_q16) >> 16);
+ 
+             _adsr_output = (int)out;
+             break;
+         }
+ 
+         case ADSR_PHASE_SUSTAIN:
+         {
+             _adsr_output = _sustain;
+             break;
+         }
+ 
+         case ADSR_PHASE_RELEASE:
+         {
+             if (_release == 0)
+             {
+                 _adsr_output = 0;
+                 _phase = ADSR_PHASE_IDLE;
+                 break;
+             }
+ 
+             if (delta >= _release)
+             {
+                 _adsr_output = 0;
+                 _phase = ADSR_PHASE_IDLE;
+                 break;
+             }
+ 
+ #if ADSR_BEZIER_USE_FLOAT
+             uint32_t idx = (uint32_t)((float)delta * _release_rate_f);
+             if (idx >= ARRAY_SIZE) idx = ARRAY_SIZE - 1;
+ #else
+             uint32_t idx = phaseIndexFixed(delta, _release, _release_scale_phase);
+ #endif
+ 
+             int curveVal = _curve_release_ptr[(int)idx];
+ 
+             int32_t out =
+               (int32_t)(((uint32_t)curveVal * _release_range_scale_q16) >> 16);
+ 
+             _adsr_output = (int)out;
+             break;
+         }
+ 
+ #if !ADSR_BEZIER_NATIVE_Q15
+         case ADSR_PHASE_IDLE:
+         default:
+         {
+             _adsr_output = 0;
+             break;
+         }
+ #else
+         default:
+             _adsr_output = 0;
+             break;
+ #endif
+         }
+ 
+         #if ADSR_BEZIER_NATIVE_Q15
+         // A/D/R: publish bus tap (curve×scale stays in [0, vr] when tables/scales valid).
+         int32_t q = nativeTapQ15(_adsr_output);
+         if (_mode == 1) q = (q - 16384) << 1;
+         else if (_mode == 2) q = -q;
+         _adsr_output_q15 = (int16_t)q;
+         return (int)_adsr_output_q15;
+ #elif ADSR_BEZIER_UPDATE_Q15_CACHE
+         // Q15 cache: skip mul when DAC level unchanged (sustain/idle).
+         if (_adsr_output != _adsr_output_q15_src) {
+             _adsr_output_q15_src = _adsr_output;
+             uint32_t q_raw = ((uint32_t)_adsr_output * _to_q15_mul) >> 16;
+             if (q_raw > (uint32_t)ADSR_Q15_ONE) q_raw = (uint32_t)ADSR_Q15_ONE;
+             
+             int32_t q = (int32_t)q_raw;
+             if (_mode == 1) q = (q - 16384) << 1;
+             else if (_mode == 2) q = -q;
+             
+             _adsr_output_q15 = (int16_t)q;
+         }
+ #endif
+         return _adsr_output;
+     }
 
     /**
      * @brief Get the Q15 amplitude representation from the last getWave() call.
@@ -950,6 +1048,10 @@ public:
     }
 
 private:
+
+/** @brief Envelope output mode */
+    uint8_t _mode = 0;
+
 #if ADSR_BEZIER_NATIVE_Q15
     /**
      * @brief Clamps native integer level to unipolar Q15 bus limits (0..ADSR_Q15_ONE).
@@ -1053,6 +1155,7 @@ private:
     int _dac_export_vr;       // ctor DAC size; used by levelDac() when NATIVE=1
     uint32_t _to_dac_mul = 0; // (dac_export_vr << 16) / ADSR_Q15_PEAK when NATIVE=1
     unsigned long _attack = 0;
+    unsigned long _active_attack = 0; // Active attack phase, to prevent clicks
     unsigned long _decay = 0; 
     int _sustain = 0;         // DAC counts (NATIVE=0) or Q15 (NATIVE=1)
     unsigned long _release = 0;
@@ -1063,6 +1166,7 @@ private:
 
 #if !ADSR_BEZIER_USE_FLOAT
     phase_scale_t _attack_scale_phase = 0;
+    phase_scale_t _active_attack_scale_phase = 0;
     phase_scale_t _decay_scale_phase = 0;
     phase_scale_t _release_scale_phase = 0;
     phase_scale_t _reset_scale_phase = 0;
@@ -1087,6 +1191,7 @@ private:
 
 #if ADSR_BEZIER_USE_FLOAT
     float _attack_rate_f = 0.0f;
+    float _active_attack_rate_f = 0.0f;
     float _decay_rate_f = 0.0f;
     float _release_rate_f = 0.0f;
     float _reset_rate_f = 0.0f;
@@ -1105,6 +1210,7 @@ private:
     uint32_t _to_q15_mul = 0;
     int _release_start;
     int _attack_start;
+    int _decay_start;
     int _notes_pressed = 0;
 };
 
