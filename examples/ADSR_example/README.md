@@ -42,6 +42,20 @@ arduino-cli compile \
 
 Or set `#define ADSR_BEZIER_USE_FLOAT 1` before `#include <ADSR_Bezier.h>`.
 
+## SRAM hot path (optional, RP2040)
+
+Library default is **`ADSR_BEZIER_SRAM_HOT=0`**. Uncomment `#define ADSR_BEZIER_SRAM_HOT 1` in the sketch (before the include), or:
+
+```bash
+arduino-cli compile \
+  --fqbn rp2040:rp2040:rpipico2 \
+  --library . \
+  --build-property build.extra_flags=-DADSR_BEZIER_SRAM_HOT=1 \
+  examples/ADSR_example
+```
+
+This pins `getWave` / `noteOn` / `noteOff` into SRAM. DCO shipping sets the flag in `adsr.h`; examples stay off for portability.
+
 ## See also
 
 - [`../ADSR_benchmark/`](../ADSR_benchmark/) — self-test, speed bench, three EnvDCO/VCA/VCF instances (DCO load model)

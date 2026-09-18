@@ -5,6 +5,7 @@
 #ifndef ADSR_BEZIER_USE_FLOAT
 #define ADSR_BEZIER_USE_FLOAT 0         // same as DCO/adsr.h
 #endif
+// #define ADSR_BEZIER_SRAM_HOT 1        // RP2040: pin getWave/noteOn/noteOff (library default 0)
 
 #include <ADSR_Bezier.h>
 
